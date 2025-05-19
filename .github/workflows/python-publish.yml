@@ -64,5 +64,6 @@ jobs:
       - name: Publish release distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
+          user: tyoshimura8869
           password: ${{ secrets.TEST_PYPI_API_TOKEN }}
           packages-dir: dist/
