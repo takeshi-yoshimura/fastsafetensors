@@ -7,10 +7,10 @@
 # documentation.
 
 name: Upload Python Package
-
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+  #release:
+  #  types: [published]
 
 permissions:
   contents: read
