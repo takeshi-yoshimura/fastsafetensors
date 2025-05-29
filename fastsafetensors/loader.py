@@ -40,9 +40,10 @@ class SafeTensorsFileLoader:
         >> print(bufs.get_tensor(loader.get_keys()[0]))
         >> loader.close()
     """
-    def __init__(self, pg: dist.ProcessGroup, device: torch.device, bbuf_size_kb: int = 16 * 1024, max_pinned_memory_in_kb: int = 64 * 1024 * 1024, max_threads: int=16, nogds: bool=False, debug_log: bool=False):
+    def __init__(self, pg: dist.ProcessGroup, device: torch.device, bbuf_size_kb: int = 16 * 1024, max_pinned_memory_in_kb: int = 64 * 1024 * 1024, max_threads: int=16, nogds: bool=False, debug_log: bool=False, framework: str="pytorch"):
         self.device = device
         self.debug_log = debug_log
+        self.framework = framework
         self.meta: Dict[str, Tuple[SafeTensorsMetadata, int]] = {}
         self.need_gds_close = False
         self.frames: OrderedDict[str, TensorFrame] = {}
