@@ -1,4 +1,4 @@
-name: Publish to PyPI
+name: Build wheel and sdist
 
 on:
   workflow_dispatch:
@@ -62,7 +62,7 @@ jobs:
           name: sdist
           path: dist/*.tar.gz
 
-  upload-testpypi:
+  upload:
     needs: [build-wheels, build-sdist]
     runs-on: ubuntu-latest
 
