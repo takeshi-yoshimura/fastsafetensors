@@ -43,7 +43,7 @@ jobs:
         pip install build twine 
 
   upload-testpypi:
-    needs: build_wheels
+    needs: build-and-publish
     runs-on: ubuntu-latest
 
     steps:
