@@ -2,6 +2,8 @@ name: Publish to PyPI
 
 on:
   workflow_dispatch:
+  release:
+    types: [published]
 
 jobs:
   build-wheels:
@@ -81,14 +83,20 @@ jobs:
         find dist -name '*.whl' -exec cp {} final_dist/ \;
         find dist -name '*.tar.gz' -exec cp {} final_dist/ \;
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
+    - name: Upload all artifact
+      uses: actions/upload-artifact@v4
       with:
-        python-version: "3.11"
-    - name: Publish to Test PyPI
-      run: |
-        python -m pip install twine
-        twine upload --repository-url https://test.pypi.org/legacy/ final_dist/*
-      env:
-        TWINE_USERNAME: __token__
-        TWINE_PASSWORD: ${{ secrets.TEST_PYPI_API_TOKEN }}
+        name: final_dist
+        path: final_dist
+
+#    - name: Set up Python
+#      uses: actions/setup-python@v5
+#      with:
+#        python-version: "3.11"
+#    - name: Publish to PyPI
+#      run: |
+#        python -m pip install twine
+#        twine upload --non-interactive final_dist/*
+#      env:
+#        TWINE_USERNAME: __token__
+#        TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
