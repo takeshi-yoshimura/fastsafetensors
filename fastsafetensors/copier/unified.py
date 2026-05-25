@@ -13,7 +13,7 @@ module never imports torch or paddle directly.
 """
 
 import os
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .. import cpp as fstcpp
 from ..common import SafeTensorsMetadata
@@ -41,34 +41,56 @@ class UnifiedMemCopier(CopierInterface):
         self.metadata = metadata
         self.device = device
         self.framework = framework
-        self._pinned: Optional[TensorBase] = None
+        self._pinned: List[TensorBase] = []
+        self.byte_ranges: Optional[List[Tuple[int, int]]] = None
+
+    def set_byte_ranges(self, byte_ranges: Optional[List[Tuple[int, int]]]) -> None:
+        """Restrict reads to these ``[start, end)`` absolute file-offset runs.
+
+        Only the bytes in the given runs are mmap-faulted, pinned, and copied;
+        the rest of the device buffer is left uninitialized (so the corresponding
+        tensors must not be requested). Tensor offsets are unchanged. ``None``
+        reads the whole data section. Build runs with
+        ``SafeTensorsMetadata.select_byte_ranges``.
+        """
+        self.byte_ranges = byte_ranges
 
     def submit_io(
         self, use_buf_register: bool, max_copy_block_size: int
     ) -> fstcpp.gds_device_buffer:
-        data_length = self.metadata.size_bytes - self.metadata.header_length
+        header_length = self.metadata.header_length
+        data_length = self.metadata.size_bytes - header_length
 
         # Allocate CUDA buffer via framework's allocator (proper lifecycle)
         gbuf = self.framework.alloc_tensor_memory(data_length, self.device)
 
-        # mmap the data section and pin its pages (kernel readahead + DMA-ready)
-        pinned = self.framework.mmap_file_pinned(
-            self.metadata.src, data_length, self.metadata.header_length
-        )
-        self._pinned = pinned
+        # Default to the whole data section, reproducing the full-file read.
+        # An empty list (vs None) reads nothing — same semantics as nogds.
+        runs = self.byte_ranges
+        if runs is None:
+            runs = [(header_length, self.metadata.size_bytes)]
 
-        # Async DMA from pinned CPU → framework-allocated CUDA buffer
-        ret = fstcpp.memcpy_h2d_async(  # type: ignore[attr-defined]
-            gbuf.get_base_address(),
-            pinned.data_ptr(),
-            data_length,
-        )
-        if ret != 0:
-            self.framework.free_tensor_memory(gbuf, self.device)
-            self._pinned = None
-            raise RuntimeError(
-                f"cudaMemcpyAsync failed with error {ret} " f"for {self.metadata.src}"
+        base_address = gbuf.get_base_address()
+        self._pinned = []
+        for start, end in runs:
+            # mmap_file_pinned faults in + pins only this run's pages
+            # (kernel readahead + DMA-ready), then DMA to the matching offset in
+            # gbuf (data section starts at header_length).
+            pinned = self.framework.mmap_file_pinned(
+                self.metadata.src, end - start, start
             )
+            self._pinned.append(pinned)
+            ret = fstcpp.memcpy_h2d_async(  # type: ignore[attr-defined]
+                base_address + (start - header_length),
+                pinned.data_ptr(),
+                end - start,
+            )
+            if ret != 0:
+                self.framework.free_tensor_memory(gbuf, self.device)
+                self._pinned = []
+                raise RuntimeError(
+                    f"cudaMemcpyAsync failed with error {ret} for {self.metadata.src}"
+                )
 
         return gbuf
 
@@ -89,7 +111,7 @@ class UnifiedMemCopier(CopierInterface):
         )
 
         # Release the pinned mmap pages
-        self._pinned = None
+        self._pinned = []
 
         return tensors
 
