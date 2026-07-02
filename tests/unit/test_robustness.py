@@ -220,3 +220,62 @@ def test_gds_fallback_warns_once_and_shares_reader(
     assert len(cache) == 1  # one shared nogds constructor for the whole loader
     framework.free_tensor_memory(g1, device)
     framework.free_tensor_memory(g2, device)
+
+
+# ---- device_memory_budget in broadcast mode ----
+
+
+class _FakePG:
+    def size(self):
+        return 2
+
+    def rank(self):
+        return 0
+
+
+def _make_loader(framework):
+    from fastsafetensors import SafeTensorsFileLoader
+
+    return SafeTensorsFileLoader(None, "cpu", nogds=True, framework="pytorch")
+
+
+def test_broadcast_explicit_budget_allowed(input_files, framework, tmp_path):
+    if framework.get_name() != "pytorch":
+        pytest.skip("pytorch-only")
+    import shutil
+
+    from fastsafetensors.parallel_loader import PipelineParallel
+
+    f2 = str(tmp_path / "copy.safetensors")
+    shutil.copy(input_files[0], f2)
+    pp = PipelineParallel(
+        _FakePG(),
+        _make_loader(framework),
+        [input_files[0], f2],
+        queue_size=0,
+        use_tqdm_on_load=False,
+        device_memory_budget=1 << 30,  # explicit int: deterministic across ranks
+    )
+    # one file per rank per group -> chunk-batch specs of width 2
+    assert pp.weight_files_batches
+    assert all(len(spec) == 2 for spec in pp.weight_files_batches)
+
+
+def test_broadcast_auto_budget_rejected(input_files, framework, tmp_path):
+    if framework.get_name() != "pytorch":
+        pytest.skip("pytorch-only")
+    import shutil
+
+    from fastsafetensors.parallel_loader import PipelineParallel
+
+    f2 = str(tmp_path / "copy2.safetensors")
+    shutil.copy(input_files[0], f2)
+    with pytest.raises(NotImplementedError, match="all-reduce"):
+        PipelineParallel(
+            _FakePG(),
+            _make_loader(framework),
+            [input_files[0], f2],
+            queue_size=0,
+            use_tqdm_on_load=False,
+            device_memory_budget="auto",
+        )
