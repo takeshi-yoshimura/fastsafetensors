@@ -2,7 +2,7 @@
 
 import platform
 import warnings
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from .. import cpp as fstcpp
 from ..common import SafeTensorsMetadata, init_logger, is_gpu_found
@@ -14,6 +14,8 @@ from .registry import CopierConstructFunc, register_copier_constructor
 
 logger = init_logger(__name__)
 
+_warned_gds_fallback = False
+
 
 class GdsFileCopier(CopierInterface):
     def __init__(
@@ -22,6 +24,7 @@ class GdsFileCopier(CopierInterface):
         device: Device,
         reader: fstcpp.gds_file_reader,
         framework: FrameworkOpBase,
+        fallback_cache: Optional[List[CopierConstructFunc]] = None,
     ):
         self.framework = framework
         self.metadata = metadata
@@ -31,6 +34,11 @@ class GdsFileCopier(CopierInterface):
         self.fh: Optional[fstcpp.gds_file_handle] = None
         self.copy_reqs: Dict[int, int] = {}
         self.aligned_length = 0
+        self._fallback: Optional[CopierInterface] = None
+        # One-slot cell shared by all copiers from the same factory, so a
+        # broken-GDS host builds a single nogds fallback reader (and its
+        # pinned bounce buffer) per loader instead of one per file.
+        self._fallback_cache = fallback_cache
         cuda_ver = framework.get_cuda_ver()
         if cuda_ver and cuda_ver != "0.0":
             # Parse version string (e.g., "cuda-12.1" or "hip-5.7.0")
@@ -65,7 +73,45 @@ class GdsFileCopier(CopierInterface):
             self.device.type == DeviceType.CUDA or self.device.type == DeviceType.GPU
         )
         ALIGN: int = fstcpp.get_alignment_size()
-        self.fh = fstcpp.gds_file_handle(self.metadata.src, self.o_direct, dev_is_cuda)
+        try:
+            self.fh = fstcpp.gds_file_handle(
+                self.metadata.src, self.o_direct, dev_is_cuda
+            )
+        except RuntimeError as e:
+            # cuFile can probe as available yet fail at I/O time: handle
+            # registration errors on compat-mode hosts or unsupported
+            # filesystems (e.g. overlayfs), or open(O_DIRECT) rejections.
+            # Downgrade this copier to the nogds bounce path instead of
+            # failing, so consumers don't each need their own gds->nogds
+            # retry. Deliberately limited to file-handle setup: failures in
+            # already-submitted reads stay fatal (falling back mid-cycle
+            # would re-read earlier data).
+            global _warned_gds_fallback
+            if not _warned_gds_fallback:
+                _warned_gds_fallback = True
+                # str(e): keeping the exception object in the log record would
+                # retain its traceback (and this frame's locals) via any
+                # record-capturing handler.
+                logger.warning(
+                    "GDS file-handle setup failed (%s); "
+                    "falling back to the nogds copier",
+                    str(e),
+                )
+            if self._fallback_cache is not None:
+                if not self._fallback_cache:
+                    self._fallback_cache.append(
+                        new_nogds_file_copier(self.device, framework=self.framework)
+                    )
+                self._fallback = self._fallback_cache[0](
+                    self.metadata, self.device, self.framework
+                )
+            else:
+                # direct construction (no factory): reader lives only for this
+                # file's submit/wait cycle and is released in wait_io
+                self._fallback = new_nogds_file_copier(
+                    self.device, framework=self.framework
+                )(self.metadata, self.device, self.framework)
+            return self._fallback.submit_io(use_buf_register, max_copy_block_size)
         offset = self.metadata.header_length
         length = self.metadata.size_bytes - self.metadata.header_length
         head_bytes = offset % ALIGN
@@ -120,6 +166,11 @@ class GdsFileCopier(CopierInterface):
         dtype: DType = DType.AUTO,
         noalign: bool = False,
     ) -> Dict[str, TensorBase]:
+        if self._fallback is not None:
+            tensors = self._fallback.wait_io(gbuf, dtype=dtype, noalign=noalign)
+            # Drop the fallback copier so its bounce-buffer reader is freed.
+            self._fallback = None
+            return tensors
         failed = []
         for req, c in sorted(self.copy_reqs.items(), key=lambda x: x[0]):
             count = self.reader.wait_read(req)
@@ -222,11 +273,15 @@ def new_gds_file_copier(
 
     reader = fstcpp.gds_file_reader(max_threads, device_is_not_cpu, device_id)
 
+    fallback_cache: List[CopierConstructFunc] = []
+
     def construct_copier(
         metadata: SafeTensorsMetadata,
         device: Device,
         framework: FrameworkOpBase,
     ) -> CopierInterface:
-        return GdsFileCopier(metadata, device, reader, framework)
+        return GdsFileCopier(
+            metadata, device, reader, framework, fallback_cache=fallback_cache
+        )
 
     return construct_copier
