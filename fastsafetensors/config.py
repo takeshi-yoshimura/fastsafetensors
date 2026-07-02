@@ -3,7 +3,7 @@
 import json
 import os
 from dataclasses import dataclass, field, fields
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from .common import init_logger
 
@@ -32,6 +32,11 @@ class LoaderConfig:
     max_concurrent_producers: int = 1
     queue_size: int = 0
     use_tqdm_on_load: bool = True
+
+    # Cap peak device-buffer bytes per rank by loading each shard in sub-file
+    # chunks (load -> [broadcast] -> release). None keeps whole-shard loading.
+    # Must be >= the largest single tensor. See SafeTensorsMetadata.plan_chunks.
+    max_batch_bytes: Optional[int] = None
 
     _extensions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
@@ -104,14 +109,19 @@ class LoaderConfig:
         return cls._from_json(path)
 
     def create_parallel_kwargs(self) -> Dict[str, Any]:
+        # Memory knobs apply with or without pipelining.
+        common: Dict[str, Any] = {
+            "max_batch_bytes": self.max_batch_bytes,
+        }
         if not self.use_pipeline:
             # queue_size=-1: fully serial (copy_files → broadcast → copy_files),
             # only 1 batch in GPU memory at a time.
-            return {"queue_size": -1}
+            return {"queue_size": -1, **common}
         return {
             "max_concurrent_producers": self.max_concurrent_producers,
             "queue_size": self.queue_size,
             "use_tqdm_on_load": self.use_tqdm_on_load,
+            **common,
         }
 
 
