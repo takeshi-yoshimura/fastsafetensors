@@ -212,7 +212,7 @@ class SafeTensorsMetadata:
         self.framework = framework
         ser = json.loads(string, object_pairs_hook=OrderedDict)
         self.metadata = ser.get("__metadata__", "")
-        if self.metadata:
+        if "__metadata__" in ser:
             del ser["__metadata__"]
         self.tensors: Dict[str, TensorFrame] = {}
         self.header_length = header_length
