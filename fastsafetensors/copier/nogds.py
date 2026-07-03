@@ -12,7 +12,7 @@ from ..common import (
 )
 from ..frameworks import FrameworkOpBase, TensorBase
 from ..st_types import Device, DeviceType, DType
-from .base import CopierInterface
+from .base import CopierInterface, validated_byte_ranges
 from .registry import CopierConstructFunc, register_copier_constructor
 
 
@@ -49,7 +49,7 @@ class NoGdsFileCopier(CopierInterface):
         requested. ``None`` (the default) reads the whole data section. Build
         runs with ``SafeTensorsMetadata.select_byte_ranges``.
         """
-        self.byte_ranges = byte_ranges
+        self.byte_ranges = validated_byte_ranges(self.metadata, byte_ranges)
 
     def submit_io(
         self, use_buf_register: bool, max_copy_block_size: int

@@ -152,11 +152,17 @@ class PipelineParallel:
             pg = SingleGroup()
         self.loader = loader
         # Read only the tensors this rank keeps (e.g. its owned experts); see
-        # SafeTensorsFileLoader.set_tensor_filter. NOTE: get_tensor broadcasts
-        # across the loader's process group, so a per-rank filter is only
-        # correct when the loader uses a single-process group (no broadcast) --
-        # use ParallelLoader(all_local=True), which sets that up.
+        # SafeTensorsFileLoader.set_tensor_filter. get_tensor broadcasts across
+        # the loader's process group, so a per-rank filter is only correct when
+        # the loader uses a single-process group (no broadcast) -- enforce it.
         if tensor_filter is not None:
+            if pg.size() > 1 or loader.pg.size() > 1:
+                raise ValueError(
+                    "tensor_filter requires a single-process loader group "
+                    "(ParallelLoader(all_local=True) or pg=None): get_tensor "
+                    "broadcasts across the loader group, which would deliver "
+                    "tensors this rank never read"
+                )
             loader.set_tensor_filter(tensor_filter)
         self.hf_weights_files = hf_weights_files
         self.max_concurrent_producers = max_concurrent_producers

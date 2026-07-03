@@ -416,6 +416,8 @@ class SafeTensorsMetadata:
             if not keep_tensor(name):
                 continue
             s, e = frame.data_offsets[0], frame.data_offsets[1]
+            if s == e:
+                continue  # zero-size tensor: nothing to read
             ranges.append((self.header_length + s, self.header_length + e))
         ranges.sort()
         merged: List[List[int]] = []

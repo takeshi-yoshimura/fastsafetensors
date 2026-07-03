@@ -175,9 +175,7 @@ class BaseSafeTensorsFileLoader:
             self_rank = self.pg.rank() == rank
             if self_rank:
                 copier = self.copier_constructor(meta, self.device, self.framework)
-                if self._tensor_filter is not None and hasattr(
-                    copier, "set_byte_ranges"
-                ):
+                if self._tensor_filter is not None:
                     copier.set_byte_ranges(meta.select_byte_ranges(self._tensor_filter))
             else:
                 copier = None

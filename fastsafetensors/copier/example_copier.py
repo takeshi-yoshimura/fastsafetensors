@@ -17,7 +17,7 @@ class ExampleCopier(CopierInterface):
         reader,
         framework: FrameworkOpBase,
     ):
-        pass
+        self.metadata = metadata
 
     def submit_io(
         self, use_buf_register: bool, max_copy_block_size: int

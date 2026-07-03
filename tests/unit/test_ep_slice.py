@@ -7,7 +7,11 @@ loading only a selected subset of tensors yields byte-identical data for the
 kept tensors while skipping the rest.
 """
 import pytest
-import torch
+
+try:
+    import torch
+except ImportError:  # paddle CI: torch-only tests self-skip below
+    torch = None  # type: ignore[assignment]
 
 from fastsafetensors import SafeTensorsMetadata
 from fastsafetensors import cpp as fstcpp
@@ -17,11 +21,13 @@ from fastsafetensors.ep_slice import (
     expert_parallel_filter,
     owned_expert_range,
 )
+from fastsafetensors.st_types import Device
 
 # The unified copier (mmap → pin_memory → cudaMemcpyAsync) needs a CUDA device;
 # skip its partial-read tests on CPU-only runners.
 _requires_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="unified copier requires a CUDA device"
+    torch is None or not torch.cuda.is_available(),
+    reason="unified copier requires a CUDA device",
 )
 
 # Reuse helpers from the main test module (tests/unit is on sys.path via conftest).
@@ -196,3 +202,128 @@ def test_unified_full_read_unchanged(fstcpp_log, input_files, framework):
     framework.free_tensor_memory(gbuf, device)
     del copier
     assert framework.get_mem_used() == 0
+
+
+# ---- byte-range validation at the copier API boundary ----
+
+
+def test_set_byte_ranges_validation(input_files, framework):
+    meta = SafeTensorsMetadata.from_file(input_files[0], framework)
+    reader = fstcpp.nogds_file_reader(False, 16 * 1024, 1, False, 0)
+    device = Device.from_str("cpu")
+
+    def fresh():
+        return NoGdsFileCopier(meta, device, reader, framework)
+
+    hl, size = meta.header_length, meta.size_bytes
+    # valid ranges are accepted and defensively copied
+    copier = fresh()
+    runs = [(hl, hl + 64), (hl + 128, size)]
+    copier.set_byte_ranges(runs)
+    assert copier.byte_ranges == runs and copier.byte_ranges is not runs
+    runs.append("garbage")  # caller mutation must not reach the copier
+    assert copier.byte_ranges[-1] == (hl + 128, size)
+    # None means full read
+    copier = fresh()
+    copier.set_byte_ranges(None)
+    assert copier.byte_ranges is None
+    # rejected: reversed / empty, overlapping or unsorted, out of bounds,
+    # before the data section, non-int offsets, malformed entries
+    for bad in (
+        [(hl + 64, hl)],
+        [(hl, hl)],
+        [(hl, hl + 128), (hl + 64, hl + 256)],
+        [(hl + 128, hl + 256), (hl, hl + 64)],
+        [(hl, size + 1)],
+        [(0, hl + 64)],
+        [(float(hl), hl + 64)],
+        [(hl,)],
+        ["nope"],
+    ):
+        with pytest.raises(ValueError):
+            fresh().set_byte_ranges(bad)
+
+
+def test_default_copier_validates_too(input_files, framework):
+    # copiers without partial-read support still validate at the API boundary
+    from fastsafetensors.copier.base import CopierInterface
+
+    class _Dummy(CopierInterface):
+        def __init__(self, metadata):
+            self.metadata = metadata
+
+        def submit_io(self, use_buf_register, max_copy_block_size):
+            raise NotImplementedError
+
+        def wait_io(self, gbuf, dtype=None, noalign=False):
+            raise NotImplementedError
+
+    meta = SafeTensorsMetadata.from_file(input_files[0], framework)
+    d = _Dummy(meta)
+    d.set_byte_ranges([(meta.header_length, meta.size_bytes)])  # ok, ignored
+    with pytest.raises(ValueError):
+        d.set_byte_ranges([(0, 1)])
+
+
+# ---- tensor_filter requires a single-process loader group ----
+
+
+def test_tensor_filter_requires_single_group(input_files, framework):
+    from fastsafetensors import SafeTensorsFileLoader
+    from fastsafetensors.parallel_loader import PipelineParallel
+
+    class _FakePG:
+        def size(self):
+            return 2
+
+        def rank(self):
+            return 0
+
+    loader = SafeTensorsFileLoader(
+        None, "cpu", nogds=True, framework=framework.get_name()
+    )
+    with pytest.raises(ValueError, match="single-process"):
+        PipelineParallel(
+            _FakePG(),
+            loader,
+            [input_files[0]],
+            use_tqdm_on_load=False,
+            tensor_filter=lambda n: True,
+        )
+    loader.close()
+
+
+def test_select_byte_ranges_skips_zero_size_tensors(tmp_path, framework):
+    # zero-element tensors are legal in safetensors (data_offsets start == end);
+    # they yield no read run but must still be instantiable after the load
+    if framework.get_name() != "pytorch":
+        pytest.skip("pytorch-only fixture creation")
+    from safetensors.torch import save_file
+
+    from fastsafetensors import SafeTensorsFileLoader
+
+    path = str(tmp_path / "zero.safetensors")
+    save_file(
+        {"empty": torch.empty(0, dtype=torch.float32), "w": torch.arange(8.0)},
+        path,
+    )
+    meta = SafeTensorsMetadata.from_file(path, framework)
+    # keeping only the zero-size tensor produces no runs at all
+    assert meta.select_byte_ranges(lambda n: n == "empty") == []
+    # full flow: filter keeping both tensors loads and instantiates both
+    loader = SafeTensorsFileLoader(None, "cpu", nogds=True, framework="pytorch")
+    loader.set_tensor_filter(lambda n: True)
+    loader.add_filenames({0: [path]})
+    fb = loader.copy_files_to_device()
+    assert fb.get_tensor("empty").shape[0] == 0
+    assert torch.equal(fb.get_tensor("w"), torch.arange(8.0))
+    fb.close()
+    loader.close()
+
+
+def test_set_byte_ranges_rejects_bool_offsets(input_files, framework):
+    meta = SafeTensorsMetadata.from_file(input_files[0], framework)
+    reader = fstcpp.nogds_file_reader(False, 16 * 1024, 1, False, 0)
+    copier = NoGdsFileCopier(meta, Device.from_str("cpu"), reader, framework)
+    with pytest.raises(ValueError, match="offsets must be int"):
+        copier.set_byte_ranges([(True, meta.size_bytes)])

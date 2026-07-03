@@ -19,7 +19,7 @@ from .. import cpp as fstcpp
 from ..common import SafeTensorsMetadata
 from ..frameworks import FrameworkOpBase, TensorBase
 from ..st_types import Device, DType
-from .base import CopierInterface
+from .base import CopierInterface, validated_byte_ranges
 from .registry import CopierConstructFunc, register_copier_constructor
 
 
@@ -53,7 +53,7 @@ class UnifiedMemCopier(CopierInterface):
         reads the whole data section. Build runs with
         ``SafeTensorsMetadata.select_byte_ranges``.
         """
-        self.byte_ranges = byte_ranges
+        self.byte_ranges = validated_byte_ranges(self.metadata, byte_ranges)
 
     def submit_io(
         self, use_buf_register: bool, max_copy_block_size: int
