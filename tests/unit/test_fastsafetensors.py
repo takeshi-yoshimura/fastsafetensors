@@ -1008,6 +1008,23 @@ def test_from_fd_short_reads(monkeypatch, tmp_dir, framework) -> None:
     assert meta.tensors["a0"].shape == [4, 8]
 
 
+def test_from_file_empty_metadata(tmp_dir, framework) -> None:
+    # Regression test: a safetensors file whose header carries an empty
+    # __metadata__: {} object must parse without raising. Previously,
+    # __metadata__ was stripped only when truthy, so {} survived into the
+    # tensor sort and raised KeyError: 'data_offsets' (see e.g. loading
+    # MiniMaxAI/MiniMax-M3-MXFP8 via vLLM --load-format fastsafetensors).
+    device, _ = get_and_check_device(framework)
+    filename = os.path.join(tmp_dir, "empty_metadata.safetensors")
+    a0 = framework.randn((4, 8), device=device, dtype=DType.F32)
+    save_safetensors_file({"a0": a0.get_raw()}, filename, {}, framework)
+
+    meta = SafeTensorsMetadata.from_file(filename, framework)
+    assert "a0" in meta.tensors
+    assert meta.tensors["a0"].shape == [4, 8]
+    assert meta.metadata == {}
+
+
 def test_no_module_level_torch_import_outside_frameworks() -> None:
     # Policy: framework-specific imports live behind the frameworks
     # abstraction. Only the torch backend (frameworks/_torch.py) may import
