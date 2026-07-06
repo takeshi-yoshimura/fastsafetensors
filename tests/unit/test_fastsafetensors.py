@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Tuple
 import pytest
 
 from fastsafetensors import (
+    ParallelLoader,
     SafeTensorsFileLoader,
     SafeTensorsMetadata,
     SingleGroup,
@@ -405,8 +406,8 @@ def test_UnifiedMemCopier(fstcpp_log, input_files, framework, monkeypatch) -> No
     for key, exp in load_safetensors_file(input_files[0], device, framework).items():
         actual = tensors[key]
         assert framework.is_equal(actual, exp)
-    # Lifecycle: pinned mmap reference released in wait_io
-    assert copier._pinned is None
+    # Lifecycle: pinned mmap references released in wait_io
+    assert copier._pinned == []
     framework.free_tensor_memory(gbuf, device)
     assert framework.get_mem_used() == 0
     assert fstcpp.get_cpp_metrics().bounce_buffer_bytes == 0
@@ -430,7 +431,7 @@ def test_UnifiedMemCopier_cuda_error(
         copier.submit_io(False, 10 * 1024 * 1024 * 1024)
     # gbuf must be freed and the pinned mmap ref released on error
     assert framework.get_mem_used() == 0
-    assert copier._pinned is None
+    assert copier._pinned == []
 
 
 @pytest.mark.parametrize(
@@ -533,7 +534,8 @@ def test_SafeTensorsFileLoader(fstcpp_log, input_files, framework) -> None:
         assert bufs.get_filename(last_key) == input_files[0]
         assert bufs.get_shape(last_key) == last_shape
         assert loader.get_shape(last_key) == last_shape
-    assert bufs.get_filename("aaaaaaaaaaaaa") == ""
+    with pytest.raises(ValueError):
+        bufs.get_filename("aaaaaaaaaaaaa")
     bufs.close()
     loader.close()
     assert framework.get_mem_used() == 0
@@ -560,6 +562,62 @@ def test_SafeTensorsFileLoaderNoGds(fstcpp_log, input_files, framework) -> None:
     loader.close()
     assert framework.get_mem_used() == 0
     assert fstcpp.get_cpp_metrics().bounce_buffer_bytes == 0
+
+
+def test_tensor_filter_hides_skipped_tensors(fstcpp_log, input_files, framework):
+    device, _ = get_and_check_device(framework)
+    meta = SafeTensorsMetadata.from_file(input_files[0], framework)
+
+    kept = set(sorted(meta.tensors.keys())[::2])
+    keep = lambda name: name in kept  # noqa: E731
+    skipped = next(name for name in meta.tensors if name not in kept)
+
+    loader = SafeTensorsFileLoader(
+        pg=SingleGroup(),
+        device=device.as_str(),
+        framework=framework.get_name(),
+        nogds=True,
+    )
+    loader.set_tensor_filter(keep)
+    loader.add_filenames({0: [input_files[0]]})
+    bufs = loader.copy_files_to_device()
+
+    assert set(loader.get_keys()) == kept
+    assert skipped not in bufs.key_to_rank_lidx
+    with pytest.raises(ValueError):
+        bufs.get_tensor(skipped)
+    with pytest.raises(ValueError):
+        bufs.get_filename(skipped)
+    with pytest.raises(ValueError):
+        loader.get_shape(skipped)
+
+    bufs.close()
+    loader.close()
+
+
+def test_tensor_filter_iterate_weights_hides_skipped(
+    fstcpp_log, input_files, framework
+):
+    device, _ = get_and_check_device(framework)
+    meta = SafeTensorsMetadata.from_file(input_files[0], framework)
+
+    kept = set(sorted(meta.tensors.keys())[::2])
+    keep = lambda name: name in kept  # noqa: E731
+
+    loader = ParallelLoader(
+        pg=SingleGroup(),
+        hf_weights_files=[input_files[0]],
+        device=device.as_str(),
+        nogds=True,
+        framework=framework.get_name(),
+        tensor_filter=keep,
+        all_local=True,
+    )
+    yielded = {key for key, _t in loader.iterate_weights()}
+    assert yielded == kept
+
+    loader.close()
+    assert framework.get_mem_used() == 0
 
 
 def test_fastsafe_open(fstcpp_log, input_files, framework) -> None:
