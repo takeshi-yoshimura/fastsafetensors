@@ -25,7 +25,7 @@ You can also use Makefile on your local environment.
 ```
 make unittest
 make unittest-parallel
-make vllm
+make test-vllm
 ```
 
 # Pre-commit Hooks
