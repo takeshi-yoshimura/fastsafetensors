@@ -36,6 +36,26 @@ jobs:
       with:
         python-version: "3.11"
 
+    # The wheel is built with the image's newest MSVC toolset, but the
+    # image's installed VC redistributable can lag behind it (14.40 vs 14.51
+    # on windows-2025-vs2026), so delvewheel would vendor an msvcp140.dll
+    # older than the toolset that built the .pyd. Install the redist that
+    # ships inside the image's own Visual Studio, which matches the toolset.
+    - name: Update VC++ redistributable to match the MSVC toolset (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        $vs = & $vswhere -latest -products * -property installationPath
+        if (-not $vs) { throw "Visual Studio installation not found" }
+        $redist = Get-ChildItem "$vs\VC\Redist\MSVC" -Recurse -Filter vc_redist.x64.exe |
+          Sort-Object { $_.VersionInfo.FileVersionRaw } | Select-Object -Last 1
+        if (-not $redist) { throw "vc_redist.x64.exe not found under $vs" }
+        Write-Host "Installing $($redist.FullName) ($($redist.VersionInfo.FileVersion))"
+        $p = Start-Process -FilePath $redist.FullName -ArgumentList '/install','/quiet','/norestart' -Wait -PassThru
+        # 1638: same or newer version already installed; 3010: success, reboot required
+        if ($p.ExitCode -notin 0, 1638, 3010) { throw "vc_redist.x64.exe exited with $($p.ExitCode)" }
+
     - name: Install cibuildwheel
       run: python -m pip install cibuildwheel setuptools pybind11
     - name: Build wheels with cibuildwheel
@@ -48,12 +68,12 @@ jobs:
         CIBW_ARCHS: "${{ matrix.platform.cibw_arch }}"
         # Bundle MSVC runtime satellite DLLs into the wheel; the VS2026 runner
         # image builds against a toolchain newer than what end-user machines
-        # (and the test env) may have installed. See windows_runner_issue.md.
+        # (and the test env) may have installed.
         CIBW_BEFORE_BUILD_WINDOWS: "pip install delvewheel"
         CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: "delvewheel repair -w {dest_dir} {wheel}"
-        # Temporary diagnostic: print the .pyd import table and where each DLL
-        # resolves from, so a load failure names the missing DLL. Remove once
-        # windows_runner_issue.md records the root cause.
+        # Diagnostic: print the .pyd import table and where each DLL resolves
+        # from, so a load failure names the missing DLL instead of Windows'
+        # generic "module could not be found".
         CIBW_TEST_REQUIRES_WINDOWS: "pefile"
         CIBW_TEST_COMMAND_WINDOWS: "python {project}/tests/dump_pyd_imports.py && python {project}/tests/smoke_import_cpp.py"
 
