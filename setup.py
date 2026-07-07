@@ -26,8 +26,8 @@ def MyExtension(name, sources, mod_name, *args, **kwargs):
         kwargs["libraries"] = []
         # c++20 required for designated initializers at ext.hpp
         kwargs["extra_compile_args"] = ["/std:c++20"]
-        # Note: dstorage.dll is loaded at runtime via LoadLibrary, not linked.
-        kwargs["libraries"].extend(["ole32", "d3d12", "dxgi", "dxguid", "uuid"])
+        # DirectStorage, D3D12, and DXGI DLLs are loaded at runtime so importing
+        # the extension does not require GPU/DirectX runtime DLLs to be present.
 
         # CUDA interop headers: if CUDA_HOME/CUDA_PATH is set, add include path
         # for cudaExternalMemory types used by the interop bridge.

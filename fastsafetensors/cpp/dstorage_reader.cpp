@@ -13,12 +13,24 @@
 
 namespace py = pybind11;
 
-#pragma comment(lib, "d3d12.lib")
-#pragma comment(lib, "dxgi.lib")
-#pragma comment(lib, "dxguid.lib")
-
 static constexpr UINT32 DS_STAGING_BUFFER_BYTES = 256u * 1024u * 1024u;
 
+static const GUID FST_IID_IDXGIFactory1 = {
+    0x770aae78, 0xf26f, 0x4dba,
+    {0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87}
+};
+static const GUID FST_IID_ID3D12Device = {
+    0x189819f1, 0x1db6, 0x4b57,
+    {0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7}
+};
+static const GUID FST_IID_ID3D12Fence = {
+    0x0a753dcf, 0xc4d8, 0x4b91,
+    {0xad, 0xf6, 0xbe, 0x5a, 0x60, 0xd9, 0x5a, 0x76}
+};
+static const GUID FST_IID_ID3D12Resource = {
+    0x696442be, 0xa72e, 0x4059,
+    {0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad}
+};
 static const GUID IID_IDStorageFactory = {
     0x6924ea0c, 0xc3cd, 0x4826,
     {0xb1, 0x0a, 0xf6, 0x4f, 0x4e, 0xd9, 0x27, 0xc1}
@@ -38,6 +50,16 @@ static PFN_DStorageGetFactory g_pfnGetFactory = nullptr;
 
 typedef HRESULT (__stdcall *PFN_DStorageSetConfiguration1)(DSTORAGE_CONFIGURATION1 const*);
 static PFN_DStorageSetConfiguration1 g_pfnSetConfig1 = nullptr;
+
+typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1)(REFIID riid, void** ppvFactory);
+static PFN_CreateDXGIFactory1 g_pfnCreateDXGIFactory1 = nullptr;
+
+typedef HRESULT (WINAPI *PFN_D3D12CreateDevice)(
+    IUnknown* pAdapter,
+    D3D_FEATURE_LEVEL minimumFeatureLevel,
+    REFIID riid,
+    void** ppDevice);
+static PFN_D3D12CreateDevice g_pfnD3D12CreateDevice = nullptr;
 
 static std::wstring utf8_to_wstring(const std::string& input) {
     int wlen = MultiByteToWideChar(CP_UTF8, 0, input.c_str(), -1, nullptr, 0);
@@ -89,6 +111,42 @@ static bool LoadDirectStorage(const std::string& dll_dir_utf8) {
     return g_pfnGetFactory != nullptr;
 }
 
+static bool LoadD3D12AndDXGI(std::string& error) {
+    static HMODULE hD3D12 = nullptr;
+    static HMODULE hDXGI = nullptr;
+
+    if (!hD3D12) {
+        hD3D12 = LoadLibraryExW(L"d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!hD3D12) {
+            error = "Failed to load d3d12.dll: " + std::to_string(GetLastError());
+            return false;
+        }
+    }
+    if (!hDXGI) {
+        hDXGI = LoadLibraryExW(L"dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!hDXGI) {
+            error = "Failed to load dxgi.dll: " + std::to_string(GetLastError());
+            return false;
+        }
+    }
+
+    g_pfnD3D12CreateDevice = reinterpret_cast<PFN_D3D12CreateDevice>(
+        GetProcAddress(hD3D12, "D3D12CreateDevice"));
+    if (!g_pfnD3D12CreateDevice) {
+        error = "d3d12.dll does not export D3D12CreateDevice";
+        return false;
+    }
+
+    g_pfnCreateDXGIFactory1 = reinterpret_cast<PFN_CreateDXGIFactory1>(
+        GetProcAddress(hDXGI, "CreateDXGIFactory1"));
+    if (!g_pfnCreateDXGIFactory1) {
+        error = "dxgi.dll does not export CreateDXGIFactory1";
+        return false;
+    }
+
+    return true;
+}
+
 // Global state, D3D12 device + DirectStorage factory
 class GlobalDStorageState {
     static inline int s_device_id = 0;
@@ -121,8 +179,10 @@ public:
             s_device = reinterpret_cast<ID3D12Device*>(provided_device);
             s_device->AddRef();
         } else {
+            if (!LoadD3D12AndDXGI(last_error_)) return false;
+
             IDXGIFactory1* factory = nullptr;
-            HRESULT hr = CreateDXGIFactory1(IID_IDXGIFactory1, (void**)&factory);
+            HRESULT hr = g_pfnCreateDXGIFactory1(FST_IID_IDXGIFactory1, (void**)&factory);
             if (FAILED(hr)) { last_error_ = "CreateDXGIFactory1 failed"; return false; }
 
             IDXGIAdapter1* adapter = nullptr;
@@ -134,7 +194,7 @@ public:
             }
             factory->Release();
             if (!adapter) { last_error_ = "No hardware D3D12 adapter found"; return false; }
-            HRESULT hr2 = D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, IID_ID3D12Device, (void**)&s_device);
+            HRESULT hr2 = g_pfnD3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, FST_IID_ID3D12Device, (void**)&s_device);
             adapter->Release();
             if (FAILED(hr2)) { last_error_ = "D3D12CreateDevice failed"; return false; }
         }
@@ -235,7 +295,7 @@ public:
         }
 
         hr = dev->CreateFence(0, D3D12_FENCE_FLAG_NONE,
-                              IID_ID3D12Fence, (void**)&fence_);
+                              FST_IID_ID3D12Fence, (void**)&fence_);
         if (FAILED(hr)) {
             fprintf(stderr, "dstorage_stream_reader: CreateFence failed hr=0x%08X\n", (unsigned)hr);
             return;
@@ -257,7 +317,7 @@ public:
             hr = dev->CreateCommittedResource(
                 &hp, D3D12_HEAP_FLAG_SHARED, &desc,
                 D3D12_RESOURCE_STATE_COMMON, nullptr,
-                IID_ID3D12Resource, (void**)&stage_res_[i]);
+                FST_IID_ID3D12Resource, (void**)&stage_res_[i]);
             if (FAILED(hr)) {
                 fprintf(stderr, "dstorage_stream_reader: CreateCommittedResource[%d] failed hr=0x%08X\n", i, (unsigned)hr);
                 return;
