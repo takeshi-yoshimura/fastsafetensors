@@ -46,6 +46,16 @@ jobs:
         CIBW_SKIP: "*-musllinux_* *-win32 *-manylinux_i686"
         CIBW_TEST_COMMAND: "python {project}/tests/smoke_import_cpp.py"
         CIBW_ARCHS: "${{ matrix.platform.cibw_arch }}"
+        # Bundle MSVC runtime satellite DLLs into the wheel; the VS2026 runner
+        # image builds against a toolchain newer than what end-user machines
+        # (and the test env) may have installed. See windows_runner_issue.md.
+        CIBW_BEFORE_BUILD_WINDOWS: "pip install delvewheel"
+        CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: "delvewheel repair -w {dest_dir} {wheel}"
+        # Temporary diagnostic: print the .pyd import table and where each DLL
+        # resolves from, so a load failure names the missing DLL. Remove once
+        # windows_runner_issue.md records the root cause.
+        CIBW_TEST_REQUIRES_WINDOWS: "pefile"
+        CIBW_TEST_COMMAND_WINDOWS: "python {project}/tests/dump_pyd_imports.py && python {project}/tests/smoke_import_cpp.py"
 
     - name: Upload wheel artifact
       uses: actions/upload-artifact@v4
