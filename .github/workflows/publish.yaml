@@ -70,7 +70,10 @@ jobs:
         # image builds against a toolchain newer than what end-user machines
         # (and the test env) may have installed.
         CIBW_BEFORE_BUILD_WINDOWS: "pip install delvewheel"
-        CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: "delvewheel repair -w {dest_dir} {wheel}"
+        # --add-path makes delvewheel take msvcp140.dll from System32 (kept
+        # current by the redist step above) instead of a stale copy that some
+        # other tool ships earlier on PATH.
+        CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: "delvewheel repair --add-path C:/Windows/System32 -w {dest_dir} {wheel}"
         # Diagnostic: print the .pyd import table and where each DLL resolves
         # from, so a load failure names the missing DLL instead of Windows'
         # generic "module could not be found".
