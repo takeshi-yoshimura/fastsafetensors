@@ -97,7 +97,9 @@ class BaseSafeTensorsFileLoader:
 
     def close(self):
         self.reset()
-        del self.copier_constructor
+        # Idempotent: repeated close() must not raise
+        if getattr(self, "copier_constructor", None) is not None:
+            self.copier_constructor = None
 
     def get_keys(self) -> List[str]:
         if self._tensor_filter is None:

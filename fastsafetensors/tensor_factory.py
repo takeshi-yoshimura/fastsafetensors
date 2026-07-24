@@ -3,6 +3,7 @@
 from typing import Dict, List, Optional, Tuple
 
 from . import cpp as fstcpp
+from .allocation import SharedDeviceAllocation
 from .common import SafeTensorsMetadata, init_logger, is_debug
 from .copier.base import CopierInterface, DummyDeviceBuffer
 from .frameworks import FrameworkOpBase, ProcessGroupBase, TensorBase
@@ -33,6 +34,10 @@ class LazyTensorFactory:
         self.tensors: Dict[str, TensorBase] = {}
         self.shuffled: Dict[str, TensorBase] = {}
         self.gbuf: Optional[fstcpp.gds_device_buffer] = None
+        # Shared owner of gbuf. Created in wait_io and referenced by every
+        # tensor materialized from the buffer, so the backing memory outlives
+        # both this factory and any exported tensor. See SharedDeviceAllocation.
+        self.allocation: Optional[SharedDeviceAllocation] = None
         self.rank = rank
         self.factory_idx_bits = factory_idx_bits
         self.lidx = lidx
@@ -49,7 +54,18 @@ class LazyTensorFactory:
 
     def wait_io(self, dtype: DType = DType.AUTO, noalign: bool = False):
         if self.copier is not None and self.gbuf is not None:
-            self.tensors = self.copier.wait_io(self.gbuf, dtype=dtype, noalign=noalign)
+            # Create the shared owner before materializing tensors so that even
+            # if wait_io raises, free_dev_ptrs() can release the buffer. Every
+            # tensor built from gbuf takes a reference through its DLPack owner.
+            self.allocation = SharedDeviceAllocation(
+                self.gbuf,
+                self.framework,
+                self.device,
+                owns_memory=not isinstance(self.gbuf, DummyDeviceBuffer),
+            )
+            self.tensors = self.copier.wait_io(
+                self.gbuf, dtype=dtype, noalign=noalign, owner=self.allocation
+            )
             if is_debug(logger):
                 for name in self.tensors.keys():
                     logger.debug("wait_io: tensor=%s", name)
@@ -259,8 +275,26 @@ class LazyTensorFactory:
         return dst
 
     def free_dev_ptrs(self):
+        """Release this factory's reference to the backing allocation.
+
+        This is a logical close: it drops the buffer-side reference and the
+        factory's internal tensor references, but does not forcibly free memory
+        that exported tensors still hold. The physical buffer is freed by
+        SharedDeviceAllocation once its last reference disappears. Idempotent:
+        safe to call repeatedly (e.g. from repeated close()).
+        """
         self.tensors = {}
-        if self.gbuf is not None and not isinstance(self.gbuf, DummyDeviceBuffer):
+        if self.allocation is not None:
+            logger.debug(
+                "free_dev_ptrs: release buf, addr=0x%x",
+                self.allocation.get_base_address() if self.allocation.live else 0,
+            )
+            self.allocation.release()
+            self.allocation = None
+            self.gbuf = None
+        elif self.gbuf is not None and not isinstance(self.gbuf, DummyDeviceBuffer):
+            # submit_io ran but wait_io never created the allocation (e.g. an
+            # error before materialization): free the raw buffer directly.
             self.framework.free_tensor_memory(self.gbuf, self.device)
             logger.debug(
                 "free_dev_ptrs: delete buf, addr=0x%x", self.gbuf.get_base_address()

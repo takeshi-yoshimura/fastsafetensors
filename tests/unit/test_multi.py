@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import gc
 import os
 
 import pytest
@@ -115,6 +116,10 @@ def test_shuffle(fstcpp_log, input_files, pg, framework):
 
     bufs.close()
     loader.close()
+    # Zero-copy tensors (as_dict / get_multi_cols same-file fastpath) keep their
+    # buffers alive past close under shared ownership; drop them first.
+    del tensors, actual
+    gc.collect()
     assert framework.get_mem_used() == 0
     assert fstcpp.get_cpp_metrics().bounce_buffer_bytes == 0
 
@@ -190,6 +195,8 @@ def test_float4_shuffle_last_dim(fstcpp_log, tmp_dir, pg, framework):
 
     bufs.close()
     loader.close()
+    del tensors, actual
+    gc.collect()
     assert framework.get_mem_used() == 0
     assert fstcpp.get_cpp_metrics().bounce_buffer_bytes == 0
 
@@ -285,6 +292,8 @@ def test_float4_float8_e8m0_collectives(fstcpp_log, tmp_dir, pg, framework):
     bufs.close()
     loader.close()
 
+    del tensors
+    gc.collect()
     assert framework.get_mem_used() == 0
     assert fstcpp.get_cpp_metrics().bounce_buffer_bytes == 0
 

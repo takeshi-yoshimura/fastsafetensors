@@ -6,12 +6,15 @@ import os
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 from . import cpp as fstcpp
 from .dlpack import from_cuda_buffer
 from .frameworks import FrameworkOpBase, TensorBase
 from .st_types import Device, DType
+
+if TYPE_CHECKING:
+    from .allocation import SharedDeviceAllocation
 
 
 def init_logger(name: str):
@@ -340,7 +343,14 @@ class SafeTensorsMetadata:
         device: Device,
         copy_start_offset: int,
         dtype: DType = DType.AUTO,
+        owner: Optional["SharedDeviceAllocation"] = None,
     ) -> Dict[str, TensorBase]:
+        """Instantiate tensors that point into *gbuf*.
+
+        When *owner* (a ``SharedDeviceAllocation``) is given, every returned
+        tensor takes shared ownership of the backing buffer through its DLPack
+        ``manager_ctx``, so it stays valid after the buffer is closed.
+        """
         ret = {}
         for tensor_name, t in self.tensors.items():
             dst_dev_ptr = (
@@ -359,6 +369,7 @@ class SafeTensorsMetadata:
                 dl_strides,
                 disk_dtype,
                 device,
+                owner,
             )
             t2 = self.framework.from_dlpack(dl_tensor, device, disk_dtype)
             if disk_dtype != t.dtype:
@@ -385,6 +396,7 @@ class SafeTensorsMetadata:
                     t.strides,
                     conv_dtype,
                     device,
+                    owner,
                 )
                 t2 = self.framework.from_dlpack(dl_tensor, device, conv_dtype)
                 if dtype != conv_dtype:

@@ -13,7 +13,7 @@ module never imports torch or paddle directly.
 """
 
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from .. import cpp as fstcpp
 from ..common import SafeTensorsMetadata
@@ -21,6 +21,9 @@ from ..frameworks import FrameworkOpBase, TensorBase
 from ..st_types import Device, DType
 from .base import CopierInterface, validated_byte_ranges
 from .registry import CopierConstructFunc, register_copier_constructor
+
+if TYPE_CHECKING:
+    from ..allocation import SharedDeviceAllocation
 
 
 class UnifiedMemCopier(CopierInterface):
@@ -99,6 +102,7 @@ class UnifiedMemCopier(CopierInterface):
         gbuf: fstcpp.gds_device_buffer,
         dtype: DType = DType.AUTO,
         noalign: bool = False,
+        owner: Optional["SharedDeviceAllocation"] = None,
     ) -> Dict[str, TensorBase]:
         self.framework.synchronize(self.device)
 
@@ -107,7 +111,7 @@ class UnifiedMemCopier(CopierInterface):
         # address. The copy_start_offset=header_length cancels out in get_tensors'
         # pointer arithmetic, giving correct offsets. No memmove fixup needed.
         tensors = self.metadata.get_tensors(
-            gbuf, self.device, self.metadata.header_length, dtype=dtype
+            gbuf, self.device, self.metadata.header_length, dtype=dtype, owner=owner
         )
 
         # Release the pinned mmap pages

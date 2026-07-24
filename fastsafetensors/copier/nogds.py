@@ -2,7 +2,7 @@
 
 import os
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from .. import cpp as fstcpp
 from ..common import (
@@ -14,6 +14,9 @@ from ..frameworks import FrameworkOpBase, TensorBase
 from ..st_types import Device, DeviceType, DType
 from .base import CopierInterface, validated_byte_ranges
 from .registry import CopierConstructFunc, register_copier_constructor
+
+if TYPE_CHECKING:
+    from ..allocation import SharedDeviceAllocation
 
 
 class NoGdsFileCopier(CopierInterface):
@@ -82,6 +85,7 @@ class NoGdsFileCopier(CopierInterface):
         gbuf: fstcpp.gds_device_buffer,
         dtype: DType = DType.AUTO,
         noalign: bool = False,
+        owner: Optional["SharedDeviceAllocation"] = None,
     ) -> Dict[str, TensorBase]:
         # Drain every request before closing the fd so no in-flight read can
         # observe a closed descriptor, then report failures.
@@ -96,7 +100,7 @@ class NoGdsFileCopier(CopierInterface):
         if len(failed) > 0:
             raise Exception(f"wait_io: wait_nogds_read failed, reqs={failed}")
         return self.metadata.get_tensors(
-            gbuf, self.device, self.metadata.header_length, dtype=dtype
+            gbuf, self.device, self.metadata.header_length, dtype=dtype, owner=owner
         )
 
 

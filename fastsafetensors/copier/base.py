@@ -2,12 +2,15 @@
 
 import operator
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from .. import cpp as fstcpp
 from ..common import SafeTensorsMetadata
 from ..frameworks import TensorBase
 from ..st_types import DType
+
+if TYPE_CHECKING:
+    from ..allocation import SharedDeviceAllocation
 
 
 def validated_byte_ranges(
@@ -87,7 +90,14 @@ class CopierInterface(ABC):
         gbuf: fstcpp.gds_device_buffer,
         dtype: DType = DType.AUTO,
         noalign: bool = False,
+        owner: Optional["SharedDeviceAllocation"] = None,
     ) -> Dict[str, TensorBase]:
+        """Materialize tensors from the completed I/O.
+
+        *owner*, when given, is the ``SharedDeviceAllocation`` backing *gbuf*;
+        it must be forwarded to ``metadata.get_tensors`` so every returned
+        tensor shares ownership of the buffer and stays valid after close.
+        """
         pass
 
 
