@@ -1,0 +1,26 @@
+{
+  "hardware_profile": "a100",
+  "defaults": {
+    "consumer": "copy",
+    "queue_size": 0,
+    "cache": "cold",
+    "repeat": 5,
+    "warmup": 0,
+    "timeout": 900.0
+  },
+  "cases": [
+    {"case_id": "a100/qwen3-8b/safetensors/ws1", "model": "qwen3-8b", "mode": "safetensors", "world_size": 1},
+    {"case_id": "a100/qwen3-8b/vllm/ws1", "model": "qwen3-8b", "mode": "vllm", "world_size": 1},
+    {"case_id": "a100/qwen3-8b/parallel/ws1", "model": "qwen3-8b", "mode": "parallel", "world_size": 1},
+    {"case_id": "a100/qwen3-8b/parallel/ws1/nogds", "model": "qwen3-8b", "mode": "parallel", "world_size": 1, "nogds": true},
+
+    {"case_id": "a100/qwen3-30b-a3b/vllm/ws1/q-1", "model": "qwen3-30b-a3b", "mode": "vllm", "world_size": 1, "queue_size": -1},
+    {"case_id": "a100/qwen3-30b-a3b/vllm/ws1/q0", "model": "qwen3-30b-a3b", "mode": "vllm", "world_size": 1, "queue_size": 0},
+    {"case_id": "a100/qwen3-30b-a3b/vllm/ws1/q1", "model": "qwen3-30b-a3b", "mode": "vllm", "world_size": 1, "queue_size": 1},
+
+    {"case_id": "a100/qwen3-30b-a3b/vllm/ws2/nogds", "model": "qwen3-30b-a3b", "mode": "vllm", "world_size": 2, "nogds": true},
+    {"case_id": "a100/qwen3-30b-a3b/vllm/ws4/nogds", "model": "qwen3-30b-a3b", "mode": "vllm", "world_size": 4, "nogds": true},
+
+    {"case_id": "a100/qwen3-32b-fp8/vllm/ws1", "model": "qwen3-32b-fp8", "mode": "vllm", "world_size": 1}
+  ]
+}

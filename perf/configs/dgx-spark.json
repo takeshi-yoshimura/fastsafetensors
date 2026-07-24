@@ -1,0 +1,23 @@
+{
+  "hardware_profile": "dgx-spark",
+  "_comment": "Blackwell / unified memory. CPU and GPU share physical memory so host RSS matters as much as CUDA allocation. FASTSAFETENSORS_DMA_THREADS is swept once then frozen for regression runs; NVFP4 cases report packed logical/storage bytes.",
+  "defaults": {
+    "consumer": "iterate",
+    "queue_size": 0,
+    "cache": "cold",
+    "repeat": 5,
+    "warmup": 0,
+    "timeout": 900.0,
+    "nogds": true
+  },
+  "cases": [
+    {"case_id": "dgx-spark/qwen3-4b/parallel/ws1/unified", "model": "qwen3-4b", "mode": "parallel", "world_size": 1},
+    {"case_id": "dgx-spark/qwen3-30b-a3b/parallel/ws1/unified", "model": "qwen3-30b-a3b", "mode": "parallel", "world_size": 1},
+
+    {"case_id": "dgx-spark/llama3.1-8b-nvfp4/vllm/ws1", "model": "llama3.1-8b-nvfp4", "mode": "vllm", "world_size": 1},
+    {"case_id": "dgx-spark/qwen3-30b-a3b-nvfp4/vllm/ws1", "model": "qwen3-30b-a3b-nvfp4", "mode": "vllm", "world_size": 1},
+
+    {"case_id": "dgx-spark/qwen3-4b/parallel/ws1/dma8", "model": "qwen3-4b", "mode": "parallel", "world_size": 1, "env": {"FASTSAFETENSORS_DMA_THREADS": "8"}},
+    {"case_id": "dgx-spark/qwen3-4b/parallel/ws1/dma16", "model": "qwen3-4b", "mode": "parallel", "world_size": 1, "env": {"FASTSAFETENSORS_DMA_THREADS": "16"}}
+  ]
+}

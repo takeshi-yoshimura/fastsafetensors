@@ -1,0 +1,18 @@
+{
+  "hardware_profile": "a2000",
+  "_comment": "Single small GPU. queue_size=-1 (serial) vs 0 (default) comparison and a bounded-max_batch_bytes direct ParallelLoader case. OOM is a valid case result, not a crashed benchmark.",
+  "defaults": {
+    "consumer": "iterate",
+    "queue_size": 0,
+    "cache": "cold",
+    "repeat": 5,
+    "warmup": 0,
+    "timeout": 600.0
+  },
+  "cases": [
+    {"case_id": "a2000/qwen3-0.6b/vllm/ws1", "model": "qwen3-0.6b", "mode": "vllm", "world_size": 1},
+    {"case_id": "a2000/qwen3-4b/vllm/ws1/q-1", "model": "qwen3-4b", "mode": "vllm", "world_size": 1, "queue_size": -1},
+    {"case_id": "a2000/qwen3-4b/vllm/ws1/q0", "model": "qwen3-4b", "mode": "vllm", "world_size": 1, "queue_size": 0},
+    {"case_id": "a2000/qwen3-4b/parallel/ws1/bounded", "model": "qwen3-4b", "mode": "parallel", "world_size": 1, "nogds": true, "max_batch_bytes": 1073741824}
+  ]
+}

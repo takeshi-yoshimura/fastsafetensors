@@ -46,7 +46,16 @@ The experiments are carried on MI300X.
 
 
 
-## GPT-2 perf tests based on the script [perf/fastsafetensors_perf/perf.py](../perf/fastsafetensors_perf/perf.py)
+## GPT-2 perf tests (predecessor benchmark)
+
+> **Historical results.** The numbers in this section were produced by the
+> original `perf/fastsafetensors_perf/perf.py` script, which has been removed.
+> Its `run-mmap`/`run-gds` CLI, `tests/sten-collection.json`, and text/pickle
+> trace parsing are no longer maintained. The current benchmark
+> (`fastsafetensors-perf`, see [perf/README.md](../perf/README.md)) replaces it
+> with machine-readable JSONL results and a regression-comparison gate. These
+> older single-GPU GPT-2 measurements are kept only as a reference point and are
+> not comparable to results from the new benchmark.
 
 ### Test Configuration
 

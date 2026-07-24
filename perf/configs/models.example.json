@@ -1,0 +1,14 @@
+{
+  "_comment": "Copy to models.local.json (git-ignored) and set real local paths. Committed configs reference only aliases; never machine-specific absolute paths.",
+  "models": {
+    "qwen3-0.6b": {"path": "Qwen3-0.6B", "revision": "main"},
+    "qwen3-4b": {"path": "Qwen3-4B", "revision": "main"},
+    "qwen3-8b": {"path": "Qwen3-8B", "revision": "main"},
+    "qwen3-30b-a3b": {"path": "Qwen3-30B-A3B", "revision": "main"},
+    "qwen3-32b-fp8": {"path": "Qwen3-32B-FP8", "revision": "main"},
+    "deepseek-v3": {"path": "DeepSeek-V3", "revision": "main"},
+    "llama3.1-8b-nvfp4": {"path": "Llama-3.1-8B-Instruct-NVFP4", "revision": "main"},
+    "qwen3-30b-a3b-nvfp4": {"path": "Qwen3-30B-A3B-NVFP4", "revision": "main"},
+    "nemotron-3-nano-30b-nvfp4": {"path": "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4", "revision": "main"}
+  }
+}

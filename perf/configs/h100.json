@@ -1,0 +1,24 @@
+{
+  "hardware_profile": "h100",
+  "_comment": "Mirrors the A100 dense/MoE matrix; H100 results are kept as a separate baseline series even with identical configs. Qwen3-32B-FP8 is a required case here.",
+  "defaults": {
+    "consumer": "copy",
+    "queue_size": 0,
+    "cache": "cold",
+    "repeat": 5,
+    "warmup": 0,
+    "timeout": 900.0
+  },
+  "cases": [
+    {"case_id": "h100/qwen3-8b/safetensors/ws1", "model": "qwen3-8b", "mode": "safetensors", "world_size": 1},
+    {"case_id": "h100/qwen3-8b/vllm/ws1", "model": "qwen3-8b", "mode": "vllm", "world_size": 1},
+    {"case_id": "h100/qwen3-8b/parallel/ws1", "model": "qwen3-8b", "mode": "parallel", "world_size": 1},
+
+    {"case_id": "h100/qwen3-30b-a3b/vllm/ws1/q0", "model": "qwen3-30b-a3b", "mode": "vllm", "world_size": 1, "queue_size": 0},
+    {"case_id": "h100/qwen3-30b-a3b/vllm/ws2/nogds", "model": "qwen3-30b-a3b", "mode": "vllm", "world_size": 2, "nogds": true},
+    {"case_id": "h100/qwen3-30b-a3b/vllm/ws4/nogds", "model": "qwen3-30b-a3b", "mode": "vllm", "world_size": 4, "nogds": true},
+
+    {"case_id": "h100/qwen3-32b-fp8/vllm/ws1", "model": "qwen3-32b-fp8", "mode": "vllm", "world_size": 1},
+    {"case_id": "h100/qwen3-32b-fp8/vllm/ws2/nogds", "model": "qwen3-32b-fp8", "mode": "vllm", "world_size": 2, "nogds": true}
+  ]
+}

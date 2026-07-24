@@ -1,19 +1,33 @@
-[tool.poetry]
-name = "fastsafetensors_perf"
-version = "0.1.0"
-description = "Performance measurement helper for fastsafetensors"
-authors = ["Takeshi Yoshimura <tyos@jp.ibm.com>"]
-
-[tool.poetry.dependencies]
-python = ">=3.10.0,<3.13"
-fastsafetensors = ">=0.1.0"
-typer = ">0.9.0"
-torch = ">2.1.0"
-safetensors = "^0.4.3"
-
-[tool.poetry.scripts]
-fastsafetensors_perf = 'fastsafetensors_perf.perf:app'
-
 [build-system]
-requires = ["poetry-core>=1.0.0"]
-build-backend = "poetry.core.masonry.api"
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastsafetensors-perf"
+version = "0.2.0"
+description = "Performance and regression benchmark for fastsafetensors ParallelLoader"
+authors = [{ name = "Takeshi Yoshimura", email = "tyos@jp.ibm.com" }]
+requires-python = ">=3.10,<3.15"
+dependencies = [
+    "fastsafetensors>=0.3.3",
+    "safetensors>=0.4.0",
+    "typer>=0.9.0",
+]
+
+# vLLM is only needed for the `vllm` and `vllm-model-load` modes. It pins the
+# whole result baseline series, so keep it as an opt-in extra rather than a hard
+# dependency of the CPU-only unit tests and `inspect`/`parallel`/`safetensors`
+# paths.
+[project.optional-dependencies]
+vllm = ["vllm[fastsafetensors]==0.25.1"]
+test = ["pytest>=7.0.0"]
+
+[project.scripts]
+fastsafetensors-perf = "fastsafetensors_perf.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["fastsafetensors_perf*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

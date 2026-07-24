@@ -1,0 +1,19 @@
+{
+  "_comment": "Shared defaults referenced by per-host matrices. Standard cases use >= 5 repetitions and cold cache. Merge these into each host config's 'defaults' as appropriate.",
+  "defaults": {
+    "consumer": "iterate",
+    "queue_size": 0,
+    "cache": "cold",
+    "repeat": 5,
+    "warmup": 0,
+    "timeout": 600.0
+  },
+  "thresholds": {
+    "time_fail": 0.15,
+    "time_warn": 0.10,
+    "ttf_warn": 0.20,
+    "mem_frac_warn": 0.10,
+    "mem_abs_warn_bytes": 536870912,
+    "cov_unstable": 0.10
+  }
+}

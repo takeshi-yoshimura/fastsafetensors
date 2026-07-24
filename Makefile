@@ -66,8 +66,12 @@ upload-test:
 upload:
 	python3 -m twine upload -u __token__ dist/fastsafetensors-$(shell grep version pyproject.toml | sed -e 's/version = "\([0-9.]\+\)"/\1/g')*
 
-perf/dist:
-	cd perf && pip install .
+# Install the fastsafetensors checkout under test together with the perf
+# benchmark so the benchmark never silently uses the PyPI wheel. See
+# perf/README.md for the full workflow.
+.PHONY: perf
+perf:
+	pip install -e . -e ./perf
 
 .PHONY: format
 format:
