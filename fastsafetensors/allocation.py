@@ -42,6 +42,15 @@ class SharedDeviceAllocation:
     arbitrary framework thread) never deadlocks against buffer close.
     """
 
+    # Process-wide live-allocation metrics. Count and total bytes of
+    # SharedDeviceAllocation instances that currently own unfreed device/host
+    # memory. Deterministic (updated under a lock at create/free), so tests and
+    # diagnostics can assert exact fastsafetensors-owned memory independently of
+    # framework allocator caches. See live_allocation_count()/live_allocation_bytes().
+    _metrics_lock = threading.Lock()
+    _live_count = 0
+    _live_bytes = 0
+
     def __init__(
         self,
         gbuf: "fstcpp.gds_device_buffer",
@@ -55,8 +64,13 @@ class SharedDeviceAllocation:
         # DummyDeviceBuffer (example copier) wraps no real allocation; freeing it
         # would be meaningless. The factory passes owns_memory=False for it.
         self._owns_memory = owns_memory
+        self._nbytes = gbuf.get_length() if owns_memory and gbuf is not None else 0
         self._refcount = 1  # the creating factory holds the initial reference
         self._lock = threading.Lock()
+        if self._owns_memory:
+            with SharedDeviceAllocation._metrics_lock:
+                SharedDeviceAllocation._live_count += 1
+                SharedDeviceAllocation._live_bytes += self._nbytes
 
     def get_base_address(self) -> int:
         """Return the base device address of the backing buffer.
@@ -97,6 +111,9 @@ class SharedDeviceAllocation:
                 self._gbuf = None
         if gbuf_to_free is not None and self._owns_memory:
             self._framework.free_tensor_memory(gbuf_to_free, self._device)
+            with SharedDeviceAllocation._metrics_lock:
+                SharedDeviceAllocation._live_count -= 1
+                SharedDeviceAllocation._live_bytes -= self._nbytes
             logger.debug(
                 "SharedDeviceAllocation.release: freed buffer, addr=0x%x",
                 gbuf_to_free.get_base_address(),
@@ -117,3 +134,25 @@ class SharedDeviceAllocation:
             f"SharedDeviceAllocation(refcount={self._refcount}, "
             f"live={self.live}, owns_memory={self._owns_memory})"
         )
+
+
+def live_allocation_count() -> int:
+    """Number of fastsafetensors device/host allocations currently unfreed.
+
+    Counts live ``SharedDeviceAllocation`` owners -- memory fastsafetensors
+    still holds (either buffer-side or via exported tensors). This is distinct
+    from bytes occupied by live framework tensors and from bytes retained in a
+    framework allocator cache; returning an allocation to the framework
+    allocator decrements this even if the allocator keeps the pages cached.
+    """
+    with SharedDeviceAllocation._metrics_lock:
+        return SharedDeviceAllocation._live_count
+
+
+def live_allocation_bytes() -> int:
+    """Total bytes of fastsafetensors device/host allocations currently unfreed.
+
+    See live_allocation_count() for the accounting boundary.
+    """
+    with SharedDeviceAllocation._metrics_lock:
+        return SharedDeviceAllocation._live_bytes

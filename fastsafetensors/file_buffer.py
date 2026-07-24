@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import warnings
 from collections import OrderedDict
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
@@ -15,7 +16,7 @@ class TensorConsumedError(ValueError):
     """Raised when a tensor name is requested after it has been consumed.
 
     A name is consumed by ``get_and_remove_tensor()`` /
-    ``get_and_remove_tensor_wrapped()`` (and, in a later PR, ``drain_tensors()``).
+    ``get_and_remove_tensor_wrapped()`` (and the bulk ``drain_tensors()``).
     Consuming access hands the caller sole ownership of the name, so any
     subsequent reusable (``get_tensor``) or consuming (``get_and_remove_tensor``)
     acquisition of the same name fails with this error. It subclasses
@@ -44,17 +45,36 @@ class FilesBufferOnDevice:
 
         Acquisition comes in two flavors. Reusable access (get_tensor(),
         get_sharded(), ...) leaves the name available to request again.
-        Consuming access (get_and_remove_tensor()) hands over the name once:
+        Consuming access (get_and_remove_tensor(), get_and_remove_sharded(),
+        get_and_remove_multi_cols(), drain_tensors()) hands over the name once:
         after it succeeds the name is removed from keys() and any further
         reusable or consuming acquisition of that name raises
         TensorConsumedError. Use keys() for the names still available and
         all_keys() for every registered name (metadata stays queryable after
         consumption).
 
+    Lifetime contract (the single contract for all process-group sizes):
+
+        - A returned tensor stays valid while that tensor, its storage, or any
+          derived view is alive -- including after close(). No clone is required
+          to outlive the buffer.
+        - close() is a logical close: it drops the buffer's own references and
+          prevents further acquisition, but leaves already-returned tensors
+          valid. It is idempotent.
+        - Physical memory is released exactly once, when the last owner (the
+          buffer plus every exported tensor) is gone. Consuming access drops the
+          buffer's internal reference immediately, so memory can be reclaimed
+          before close() once the caller drops the tensor.
+        - live_allocation_count()/live_allocation_bytes() report the memory
+          fastsafetensors still owns, for tests and diagnostics.
+
     Args:
         rank_loaders (Dict<rank, list(LazyTensorFacotry)>): Tensor factories per rank, which hold device pointers for buffers.
         pg (ProcessGroupBase): process group for calling distributed ops.
-        auto_mem_delete (bool): automatically release device buffers when all the tensors are shuffled.
+        auto_mem_delete (bool, optional): DEPRECATED. Eagerly release device
+            buffers as tensors are handed out. Superseded by consuming access
+            (get_and_remove_tensor()/drain_tensors()); passing it explicitly
+            emits a DeprecationWarning. Defaults to None (historical behavior).
         keep_tensor (Callable[[str], bool], optional): If set, only tensors for
             which ``keep_tensor(name)`` is True are registered in ``key_to_rank_lidx``;
             others raise ``ValueError`` from ``get_tensor`` / ``get_filename`` /
@@ -70,7 +90,7 @@ class FilesBufferOnDevice:
         rank_loaders: Dict[int, List[LazyTensorFactory]],
         pg: ProcessGroupBase,
         framework: FrameworkOpBase,
-        auto_mem_delete: bool = True,
+        auto_mem_delete: Optional[bool] = None,
         keep_tensor: Optional[Callable[[str], bool]] = None,
     ):
         self.framework = framework
@@ -103,9 +123,22 @@ class FilesBufferOnDevice:
         # auto_mem_delete eagerly drops internal references as tensors are handed
         # out (reusable access then cannot re-request the same name). It stays
         # gated to distributed groups for backward compatibility -- single-group
-        # zero-copy access keeps names reusable until close. This flag is
-        # transitional and is superseded by consuming access
-        # (get_and_remove_*/drain_tensors); it is slated for deprecation.
+        # zero-copy access keeps names reusable until close.
+        #
+        # DEPRECATED: this flag is superseded by consuming access
+        # (get_and_remove_tensor()/drain_tensors()) and will be removed in a
+        # future breaking release. Passing it explicitly warns; the default
+        # (None) preserves the historical behavior for now.
+        if auto_mem_delete is not None:
+            warnings.warn(
+                "auto_mem_delete is deprecated. "
+                "Use get_and_remove_tensor() or drain_tensors() for consuming "
+                "access.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        else:
+            auto_mem_delete = True
         self.auto_mem_delete = auto_mem_delete and self.pg.size() > 1
 
     def close(self):

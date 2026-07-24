@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Release-timing tests for consuming access and the auto_mem_delete rework.
+"""Release-timing tests for consuming access and auto_mem_delete.
 
-PR 3 replaces the count-based ``instantiated`` accounting with reference drops:
-consuming access (get_and_remove_*) and auto_mem_delete drop the factory's
+Consuming access (get_and_remove_*) and auto_mem_delete drop the factory's
 internal reference to a name, and the backing buffer is released by shared
 ownership once the factory's retained set drains and no exported tensor still
 references it -- there is no explicit "last tensor" free.

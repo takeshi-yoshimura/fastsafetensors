@@ -28,14 +28,25 @@ The technology helps minimize copy overheads from NVMe SSDs to GPU memory by byp
 
 After creating a `SafeTensorsFileLoader` instance, first map target files and a rank using the `.add_filenames()` method. Then, call `.copy_file_to_device()` to trigger the actual file copies on aggregated GPU memory fragments and directly instantiate a group of tensors. Once the files are loaded, you can retrieve a tensor using the `.get_tensor()` method. Additionally, you can obtain sharded tensors by `.get_sharded()`, which internally runs collective operations in `torch.distributed`.
 
-Important: To release the GPU memory allocated for tensors, you must explicitly call the `.close()` method. This is because fastsafetensors allows multiple tensors to share a limited number of GPU memory fragments. As a result, it is the user's responsibility to ensure that all tensors are properly released before calling `.close()`, which will then safely release the underlying GPU memory.
+## Lifetime contract
 
-`fastsafe_open` is an easier entrypoint. You can force GDS off and run in fallback mode if `nogds=True`. However, users must be aware of the above tricky memory management model, which should be fixed in future releases.
+Every returned tensor takes shared ownership of its backing device allocation, so it — and any derived view — stays valid even after `.close()`; no clone is required to use the data afterwards. `.close()` is a logical close: it drops the buffer's own references and is idempotent. The underlying memory is released exactly once, when the last owner (the buffer plus every exported tensor) is gone.
+
+Acquisition comes in two flavors:
+
+- **Reusable** — `get_tensor()`, `get_sharded()`, `get_multi_cols()`, `as_dict()`: the name can be requested again; its buffer is held until `close()`.
+- **Consuming** — `get_and_remove_tensor()`, `get_and_remove_sharded()`, `get_and_remove_multi_cols()`, and the bulk `drain_tensors()`: the name is handed over once (removed from `keys()`; later access raises `TensorConsumedError`) and the buffer's internal reference is dropped immediately, so memory can be reclaimed before `close()` once you drop the tensor. This is the preferred path for one-shot iteration over every key.
+
+`live_allocation_count()` / `live_allocation_bytes()` report the memory fastsafetensors still owns, for tests and diagnostics.
+
+> The `auto_mem_delete` flag is deprecated; use consuming access instead.
+
+`fastsafe_open` is an easier entrypoint. You can force GDS off and run in fallback mode if `nogds=True`.
 
 ```python
 with fastsafe_open(filenames=[filename], nogds=True, device="cpu", debug_log=True) as f:
-    for key in f.get_keys():
-        t = f.get_tensor(key).clone().detach() # clone if t is used outside
+    for key in f.keys():
+        t = f.get_tensor(key)  # stays valid after the block; no clone needed
 ```
 
 # AutoLoader configuration

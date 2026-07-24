@@ -4,6 +4,7 @@ from importlib.metadata import version
 
 __version__ = version(__name__)
 
+from .allocation import live_allocation_bytes, live_allocation_count
 from .auto_loader import AutoLoader
 from .common import (
     SafeTensorsMetadata,
