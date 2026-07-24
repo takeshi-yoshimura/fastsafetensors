@@ -192,9 +192,6 @@ class PipelineParallel:
         # Logging setup - get from environment variable, default to False
         self.print_log = os.getenv("FASTSAFETENSORS_DEBUG", "false").lower() == "true"
         self.log_prefix = f"PG{pg.rank() if pg is not None else 0}"
-        # When pg.size() == 1, tensors reference the underlying gbuf memory
-        # which will be freed in fb.close(). Clone to ensure data survives.
-        self.need_clone = pg.size() == 1 if pg is not None else True
 
         fstcpp.set_gil_release(True)
 
@@ -228,6 +225,38 @@ class PipelineParallel:
 
     def _log_error(self, message: str):
         self._log_message(message, is_error=True)
+
+    def _safe_put(self, item) -> bool:
+        """Enqueue *item*, giving up (returning False) if we are shutting down.
+
+        Uses a bounded wait so the producer never blocks forever on a full queue
+        after the consumer has stopped reading (early termination / failure).
+        """
+        while not self.stop_event.is_set():
+            try:
+                self.batch_queue.put(item, timeout=0.2)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _drain_and_close_queue(self) -> None:
+        """Drain any queued batches and close their buffers.
+
+        Called during shutdown so buffers produced but never consumed (early
+        termination or a consumer failure) release their device memory instead
+        of lingering until garbage collection.
+        """
+        while True:
+            try:
+                item = self.batch_queue.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(item, FileBatch):
+                try:
+                    item.fb.close()
+                except Exception as e:  # best-effort cleanup
+                    self._log_error(f"error closing drained batch {item.batch_id}: {e}")
 
     def _load_single_batch(self, batch_id: int, file_list: List[str]):
         """Load a single batch into device memory.
@@ -284,16 +313,24 @@ class PipelineParallel:
             batch.copy_files_time = copy_time
             batch.load_time = add_filenames_time + copy_time  # Total load time
 
-            # Put into queue for consumer processing
-            if not self.stop_event.is_set():
-                self.batch_queue.put(batch)
+            # Put into queue for consumer processing. If we are shutting down
+            # (consumer stopped/failed), close the buffer we just created rather
+            # than leaking it, since it will never be consumed.
+            if self._safe_put(batch):
                 with TimingContext("loader.reset", self._log_message, batch_id):
                     self.loader.reset()
+            else:
+                self._log_message(
+                    f"Producer batch {batch_id} not enqueued (stopping); "
+                    f"closing its buffer",
+                    is_error=True,
+                )
+                batch.fb.close()
 
         except Exception as e:
             self.error_info = f"Producer batch {batch_id} failed: {e}"
             self.error_event.set()
-            self.batch_queue.put(e)  # Notify consumer of error
+            self._safe_put(e)  # Notify consumer of error (best-effort)
 
     def _producer_worker(self):
         """Producer worker thread: responsible for copy_files_to_device operations.
@@ -316,10 +353,10 @@ class PipelineParallel:
             if not self.error_event.is_set():
                 self.error_info = f"Producer future failed: {e}"
                 self.error_event.set()
-                self.batch_queue.put(e)
+                self._safe_put(e)
 
-        # Signal end of production
-        self.batch_queue.put(None)
+        # Signal end of production (best-effort: skipped if already stopping)
+        self._safe_put(None)
 
     def _consume_single_batch(self):
         with TimingContext("wait_queue", self._log_message) as timer:
@@ -351,10 +388,10 @@ class PipelineParallel:
             with TimingContext(
                 "get_tensor", self._log_message, batch.batch_id
             ) as timer:
-                for key in batch.keys:
-                    tensor = batch.fb.get_tensor(key)
-                    if self.need_clone:
-                        tensor = tensor.clone()
+                # Consuming access: each tensor retains shared ownership of its
+                # backing buffer, so it stays valid after fb.close() below with
+                # no lifetime clone required (single- or multi-process alike).
+                for key, tensor in batch.fb.drain_tensors():
                     yield key, tensor
             get_tensor_time = timer.elapsed_ms
         finally:
@@ -421,11 +458,24 @@ class PipelineParallel:
         try:
             yield from self._consumer_worker()
         finally:
-            # Cleanup work
+            # Cleanup work. Signal the producer to stop, release the unbuffered
+            # handshake it may be waiting on, then close any buffers it produced
+            # but that were never consumed (early break / consumer failure).
             self.stop_event.set()
+            if self.consumer_processed is not None:
+                self.consumer_processed.set()
+            self._drain_and_close_queue()
             producer_thread.join(timeout=5)
+            # Final sweep for anything enqueued between the drain and the join.
+            self._drain_and_close_queue()
 
     def close(self):
+        # Idempotent: stop any in-flight producer, drop queued buffers, and
+        # close the loader (which is itself safe to call repeatedly).
+        self.stop_event.set()
+        if self.consumer_processed is not None:
+            self.consumer_processed.set()
+        self._drain_and_close_queue()
         self.loader.close()
 
 

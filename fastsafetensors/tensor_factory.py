@@ -133,8 +133,9 @@ class LazyTensorFactory:
 
     def shuffle(self, pg: ProcessGroupBase, tensor_name: str, dim: int) -> TensorBase:
         if pg.size() == 1:
-            # The returned tensor shares the backing gbuf lifetime; public APIs
-            # document that callers must clone/copy before buffer close.
+            # Zero-copy: the returned tensor holds shared ownership of the
+            # backing allocation (via its DLPack owner), so it stays valid after
+            # the buffer is closed -- no clone required.
             return self.tensors[tensor_name]
         if tensor_name in self.shuffled:
             logger.debug("shuffle: use cache, tensor_name=%s", tensor_name)

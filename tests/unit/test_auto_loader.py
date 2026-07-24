@@ -248,7 +248,6 @@ class TestPipelineParallelSingleProcess:
 
         assert pipeline.weight_files_batches == [["a.safetensors"], ["b.safetensors"]]
         assert pipeline.log_prefix == "PG0"
-        assert pipeline.need_clone is True
 
 
 class TestAutoLoaderConfigDiscovery:

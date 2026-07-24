@@ -51,6 +51,7 @@ jobs:
           COVERAGE_FILE=.coverage_own pytest -s --cov=${LIBDIR} test_tensor_ownership.py > /tmp/pytest-log/tensor_ownership.log 2>&1
           COVERAGE_FILE=.coverage_gar pytest -s --cov=${LIBDIR} test_get_and_remove_tensor.py > /tmp/pytest-log/get_and_remove_tensor.log 2>&1
           COVERAGE_FILE=.coverage_rel pytest -s --cov=${LIBDIR} test_consuming_release.py > /tmp/pytest-log/consuming_release.log 2>&1
+          COVERAGE_FILE=.coverage_drain pytest -s --cov=${LIBDIR} test_drain_tensors.py > /tmp/pytest-log/drain_tensors.log 2>&1
           COVERAGE_FILE=.coverage_ep pytest -s --cov=${LIBDIR} test_ep_slice.py > /tmp/pytest-log/ep_slice.log 2>&1
           COVERAGE_FILE=.coverage_config pytest -s --cov=${LIBDIR} test_config.py > /tmp/pytest-log/config.log 2>&1
           COVERAGE_FILE=.coverage_auto pytest -s --cov=${LIBDIR} test_auto_loader.py > /tmp/pytest-log/auto_loader.log 2>&1

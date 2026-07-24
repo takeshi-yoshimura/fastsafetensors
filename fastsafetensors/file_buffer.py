@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from collections import OrderedDict
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 from .common import init_logger
 from .frameworks import FrameworkOpBase, ProcessGroupBase, TensorBase
@@ -417,3 +417,38 @@ class FilesBufferOnDevice:
             if self.auto_mem_delete:
                 self._release_internal(rank, lidx, tensor_name)
         return tensors
+
+    def drain_tensors_wrapped(
+        self,
+        device: Optional[Device] = None,
+        dtype: DType = DType.AUTO,
+    ) -> "Iterator[Tuple[str, TensorBase]]":
+        """Yield ``(name, wrapped tensor)`` for every available name, consuming
+        each as it is produced.
+
+        This is the preferred path for weight iterators and downstream
+        integrations that visit every key exactly once. Each name is consumed
+        (as by get_and_remove_tensor), so it is removed from keys() and the
+        factory's internal reference is dropped; the yielded tensor retains
+        shared ownership and stays valid after close(). Names are visited in
+        registration order, which is identical across ranks -- required for the
+        distributed broadcast/scatter collectives to stay in step.
+
+        Iteration starts from a snapshot of the currently available names, so
+        names already consumed before draining are skipped.
+        """
+        for name in self.keys():
+            yield name, self.get_and_remove_tensor_wrapped(name, device, dtype)
+
+    def drain_tensors(
+        self,
+        device: Optional[Device] = None,
+        dtype: DType = DType.AUTO,
+    ) -> "Iterator[Tuple[str, Any]]":
+        """Yield ``(name, tensor)`` for every available name, consuming each.
+
+        Raw-tensor counterpart of drain_tensors_wrapped(); see it for the
+        consuming contract.
+        """
+        for name, t in self.drain_tensors_wrapped(device, dtype):
+            yield name, t.get_raw()
