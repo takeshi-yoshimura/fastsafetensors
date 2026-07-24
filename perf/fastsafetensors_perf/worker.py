@@ -237,7 +237,8 @@ def _run_once_with_timeout(files: List[str], device: str, pg, options: LoaderOpt
 
 def _repetition(rep: int, dist: Dist, files: List[str], device: str,
                 config: RunConfig,
-                expected_names_digest: Optional[int] = None) -> RankMetrics:
+                expected_names_digest: Optional[int] = None,
+                source_bytes_this_rank: int = 0) -> RankMetrics:
     options = config.options
     # cold: evict before every recorded repetition; barrier so all ranks start
     # from the same cache state.
@@ -279,6 +280,7 @@ def _repetition(rep: int, dist: Dist, files: List[str], device: str,
     m.consumer_copy_seconds = result.consumer_copy_seconds
     m.tensor_count = result.tensor_count
     m.logical_bytes = result.logical_bytes
+    m.source_checkpoint_bytes = source_bytes_this_rank
 
     # Correctness: the delivered key set must match the header inventory. Without
     # a tensor_filter every rank receives every tensor (broadcast), so this holds
@@ -359,6 +361,15 @@ def run_case(config: RunConfig) -> int:
         t.name for shard in inv.shards for t in shard.tensors
     )
 
+    # Bytes this rank reads from disk. Exact for single-rank; for multi-rank the
+    # shards are partitioned across ranks, which we approximate as an even split
+    # (exact when shards are equal-sized and evenly divisible). Used only for the
+    # storage-throughput diagnostic, never for correctness.
+    if dist.world_size <= 1:
+        source_bytes_this_rank = inv.source_checkpoint_bytes
+    else:
+        source_bytes_this_rank = inv.source_checkpoint_bytes // dist.world_size
+
     # Recorded repetitions. Abort this rank's remaining reps after a timeout.
     my_metrics: List[RankMetrics] = []
     aborted = False
@@ -369,7 +380,8 @@ def run_case(config: RunConfig) -> int:
                                           error="aborted after prior timeout"))
             continue
         m = _repetition(rep, dist, files, device, config,
-                        expected_names_digest=expected_digest)
+                        expected_names_digest=expected_digest,
+                        source_bytes_this_rank=source_bytes_this_rank)
         if m.status == "timeout":
             aborted = True
         my_metrics.append(m)

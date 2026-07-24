@@ -46,7 +46,20 @@ fastsafetensors-perf matrix configs/a100.json \
 
 # Gate a candidate against a baseline (exit code drives CI):
 fastsafetensors-perf compare results/baseline.jsonl results/candidate.jsonl
+
+# Cross-configuration comparison for a report/talk (NON-gating):
+fastsafetensors-perf report results/*.jsonl --group-by mode \
+  --baseline-field mode --baseline-value safetensors
 ```
+
+`compare` and `report` are complementary. `compare` is the **regression gate**:
+it refuses to compare across different identities (a different GPU/model/vLLM
+version is a different baseline series). `report` is the opposite — it
+**deliberately** lines results up across an axis (mode, world size, queue size,
+cache, model) to answer "how much faster is X than Y?", e.g. safetensors vs
+fastsafetensors, or 1- vs 2-GPU scaling. `--json` emits chart-ready series. The
+same JSONL feeds both, so data collected for regression testing is reusable for
+a performance write-up.
 
 ## Benchmark modes
 

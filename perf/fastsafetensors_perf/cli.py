@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 import typer
 
 from . import compare as compare_mod
+from . import report as report_mod
 from .loaders import LoaderOptions
 from .models import inspect_checkpoint
 from .results import iter_records
@@ -238,6 +239,37 @@ def compare(baseline: str = typer.Argument(...),
                        f"fst={ident.get('fastsafetensors_series', '?')}")
     typer.echo(f"=> {report.exit_code.name} (exit {int(report.exit_code)})")
     raise typer.Exit(int(report.exit_code))
+
+
+# --- report -----------------------------------------------------------------
+
+
+@app.command()
+def report(results: List[str] = typer.Argument(..., help="one or more result JSONL files"),
+           group_by: str = typer.Option("mode", "--group-by",
+                                         help="comma-separated identity fields, e.g. mode or world_size"),
+           metric: str = typer.Option("delivery_gbps", "--metric",
+                                       help="delivery_gbps|storage_gbps|wall_s|ttf_s|peak_cuda_gb|peak_rss_gb"),
+           baseline_field: Optional[str] = typer.Option(None, "--baseline-field"),
+           baseline_value: Optional[str] = typer.Option(None, "--baseline-value"),
+           json_out: bool = typer.Option(False, "--json", help="emit chart-ready JSON")):
+    """Cross-configuration performance comparison (non-gating).
+
+    Unlike `compare`, this deliberately lines results up across an axis to show
+    relative speed. Example (safetensors vs fastsafetensors):
+
+        fastsafetensors-perf report results/*.jsonl --group-by mode \\
+            --baseline-field mode --baseline-value safetensors
+    """
+    fields = [f.strip() for f in group_by.split(",") if f.strip()]
+    aggs = report_mod.load_aggregates(results)
+    rows = report_mod.build_report(aggs, fields, metric=metric,
+                                   baseline_field=baseline_field,
+                                   baseline_value=baseline_value)
+    if json_out:
+        typer.echo(json.dumps(report_mod.to_chart_data(rows), indent=2))
+    else:
+        typer.echo(report_mod.format_table(rows))
 
 
 if __name__ == "__main__":
