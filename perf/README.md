@@ -87,6 +87,26 @@ One JSONL file per case, holding:
 carries `identity`, `environment`, and `case` blocks. Human-readable stdout is
 never parsed to build results.
 
+### Resource telemetry (schema 1.1)
+
+Each rank samples the timed region (read-only `/proc` + NVML, no CUDA/NCCL, so it
+is safe alongside collectives) and records:
+
+| Field | Meaning |
+|---|---|
+| `cpu_user_pct` / `cpu_system_pct` | process CPU over the window, % of one core (a multi-threaded loader exceeds 100) |
+| `host_mem_increase_bytes` | peak host RSS during the load minus RSS at start |
+| `disk_read_bytes` / `disk_read_bps` | block-layer reads (real disk I/O; 0 on tmpfs or a warm cache) |
+| `read_char_bytes` / `read_char_bps` | bytes via `read()`/`pread()` — informative on RAM/networked FS where block accounting is 0 (0 for the mmap `safetensors` path, which faults pages instead) |
+| `gpu_util_pct` | mean NVML GPU utilization over the window |
+| `gpu_mem_used_bytes` | peak NVML device memory used (device-level, not the torch allocator) |
+| `nvlink_bytes` / `nvlink_bps` | NVLink TX+RX over the window (non-zero mainly for tensor-parallel broadcast) |
+
+In the aggregate: CPU / host-mem / disk / read / NVLink **sum** across ranks
+(node totals), GPU utilization **averages** across GPUs, GPU memory is the **max**
+(worst device). Report them with e.g. `--metric gpu_util_pct`, `--metric
+nvlink_gbps`, `--metric read_gbps`.
+
 ### Baseline identity
 
 Two results may only be compared as the same series when **every** identity field

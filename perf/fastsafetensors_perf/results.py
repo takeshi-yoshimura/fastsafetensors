@@ -27,7 +27,8 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional
 # Bump the MINOR component for additive, backward-compatible fields; bump MAJOR
 # when a reader must change to interpret existing fields. ``compare`` refuses to
 # gate across different MAJOR versions.
-SCHEMA_VERSION = "1.0"
+# 1.1: added resource telemetry (CPU/mem/disk/GPU/NVLink) to RankMetrics.
+SCHEMA_VERSION = "1.1"
 
 RECORD_KIND_RANK = "rank"
 RECORD_KIND_AGGREGATE = "aggregate"
@@ -153,6 +154,22 @@ class RankMetrics:
     peak_cuda_allocated_bytes: int = 0
     peak_cuda_reserved_bytes: int = 0
     host_peak_rss_bytes: int = 0
+
+    # Resource telemetry sampled across the timed region (schema 1.1). CPU
+    # percentages are relative to one core (a multi-threaded loader can exceed
+    # 100). GPU util/memory come from NVML (device-level, not the torch
+    # allocator). disk/NVLink are block-layer / link byte deltas over the run.
+    cpu_user_pct: float = 0.0
+    cpu_system_pct: float = 0.0
+    host_mem_increase_bytes: int = 0
+    disk_read_bytes: int = 0
+    disk_read_bps: float = 0.0
+    read_char_bytes: int = 0
+    read_char_bps: float = 0.0
+    gpu_util_pct: float = 0.0
+    gpu_mem_used_bytes: int = 0
+    nvlink_bytes: int = 0
+    nvlink_bps: float = 0.0
 
     requested_backend: str = ""
     effective_backend: str = ""

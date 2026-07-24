@@ -27,6 +27,26 @@ _METRIC_LABELS = {
     "ttf_s": "time-to-first s",
     "peak_cuda_gb": "peak CUDA GB",
     "peak_rss_gb": "peak RSS GB",
+    "disk_gbps": "disk GB/s",
+    "read_gbps": "read GB/s",
+    "nvlink_gbps": "NVLink GB/s",
+    "gpu_util_pct": "GPU util %",
+    "gpu_mem_gb": "GPU mem GB",
+    "cpu_user_pct": "CPU user %",
+    "cpu_system_pct": "CPU sys %",
+    "mem_increase_gb": "mem +GB",
+}
+
+# metric name -> (stats key, scale). Scale converts stored units to display.
+_SIMPLE_METRICS = {
+    "disk_gbps": ("disk_read_bps", 1e9),
+    "read_gbps": ("read_char_bps", 1e9),
+    "nvlink_gbps": ("nvlink_bps", 1e9),
+    "gpu_util_pct": ("gpu_util_pct", 1.0),
+    "gpu_mem_gb": ("gpu_mem_used_bytes", 1e9),
+    "cpu_user_pct": ("cpu_user_pct", 1.0),
+    "cpu_system_pct": ("cpu_system_pct", 1.0),
+    "mem_increase_gb": ("host_mem_increase_bytes", 1e9),
 }
 
 
@@ -56,6 +76,9 @@ def metric_value(agg: Dict[str, Any], name: str) -> float:
         return _median(agg, "peak_cuda_allocated_bytes") / 1e9
     if name == "peak_rss_gb":
         return _median(agg, "host_peak_rss_bytes") / 1e9
+    if name in _SIMPLE_METRICS:
+        stat_key, scale = _SIMPLE_METRICS[name]
+        return _median(agg, stat_key) / scale
     raise ValueError(f"unknown metric: {name}")
 
 
@@ -72,6 +95,15 @@ class ReportRow:
     cov: float
     n_reps: int
     status: str
+    # Resource telemetry (schema 1.1); 0 on older records.
+    disk_gbps: float = 0.0
+    read_gbps: float = 0.0
+    nvlink_gbps: float = 0.0
+    gpu_util_pct: float = 0.0
+    gpu_mem_gb: float = 0.0
+    cpu_user_pct: float = 0.0
+    cpu_system_pct: float = 0.0
+    mem_increase_gb: float = 0.0
     speedup: Optional[float] = None  # vs the chosen baseline, if any
 
     def label(self) -> str:
@@ -103,6 +135,14 @@ def _row(agg: Dict[str, Any], group_by: Sequence[str], metric: str) -> ReportRow
         cov=_stats(agg).get("wall_seconds", {}).get("cov", 0.0),
         n_reps=int(agg_block.get("n_repetitions", 0)),
         status=agg_block.get("worst_status", "ok"),
+        disk_gbps=metric_value(agg, "disk_gbps"),
+        read_gbps=metric_value(agg, "read_gbps"),
+        nvlink_gbps=metric_value(agg, "nvlink_gbps"),
+        gpu_util_pct=metric_value(agg, "gpu_util_pct"),
+        gpu_mem_gb=metric_value(agg, "gpu_mem_gb"),
+        cpu_user_pct=metric_value(agg, "cpu_user_pct"),
+        cpu_system_pct=metric_value(agg, "cpu_system_pct"),
+        mem_increase_gb=metric_value(agg, "mem_increase_gb"),
     )
 
 
@@ -187,5 +227,13 @@ def to_chart_data(rows: Sequence[ReportRow]) -> Dict[str, Any]:
         "ttf_s": [r.ttf_s for r in rows],
         "peak_cuda_gb": [r.peak_cuda_gb for r in rows],
         "cov": [r.cov for r in rows],
+        "disk_gbps": [r.disk_gbps for r in rows],
+        "read_gbps": [r.read_gbps for r in rows],
+        "nvlink_gbps": [r.nvlink_gbps for r in rows],
+        "gpu_util_pct": [r.gpu_util_pct for r in rows],
+        "gpu_mem_gb": [r.gpu_mem_gb for r in rows],
+        "cpu_user_pct": [r.cpu_user_pct for r in rows],
+        "cpu_system_pct": [r.cpu_system_pct for r in rows],
+        "mem_increase_gb": [r.mem_increase_gb for r in rows],
         "speedup": [r.speedup for r in rows],
     }

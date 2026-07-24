@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from . import environment, metrics as metrics_mod
 from .loaders import LoaderOptions, run_consume
 from .models import inspect_checkpoint
+from .telemetry import ResourceMonitor
 from .results import (
     Identity,
     RankMetrics,
@@ -127,6 +128,23 @@ def _device_str() -> str:
     except Exception:
         pass
     return "cpu"
+
+
+def _nvml_index(local_rank: int) -> int:
+    """Physical NVML device index for this rank.
+
+    NVML enumerates physical GPUs and ignores CUDA_VISIBLE_DEVICES, so map the
+    rank back through CUDA_VISIBLE_DEVICES to sample the GPU this rank actually
+    uses.
+    """
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if cvd:
+        ids = [x for x in cvd.split(",") if x.strip() != ""]
+        try:
+            return int(ids[local_rank])
+        except (IndexError, ValueError):
+            return local_rank
+    return local_rank
 
 
 # --- cache protocol ---------------------------------------------------------
@@ -259,6 +277,11 @@ def _repetition(rep: int, dist: Dist, files: List[str], device: str,
         pass
     dist.barrier()
 
+    # Sample CPU/mem/disk/GPU/NVLink across the timed region. The sampler only
+    # reads /proc and NVML (no CUDA/NCCL), so it is safe next to collectives.
+    monitor = ResourceMonitor(device_index=_nvml_index(dist.local_rank),
+                              enable_nvml=device.startswith("cuda"))
+    monitor.start()
     start = from_time()
     result, status, error = _run_once_with_timeout(
         files, device, dist.pg, options, start, dist.world_size, config.timeout_seconds
@@ -266,10 +289,23 @@ def _repetition(rep: int, dist: Dist, files: List[str], device: str,
     # Local end timestamp (result already synchronized CUDA). Per-rank wall is
     # this rank's own time; the aggregate takes the slowest rank.
     end = from_time()
+    telem = monitor.stop()
     dist.barrier()
 
     m = RankMetrics(rank=dist.rank, repetition=rep, status=status, ok=(status == "ok"),
                     error=error)
+    # Telemetry is meaningful even on error/timeout, so record it either way.
+    m.cpu_user_pct = telem.cpu_user_pct
+    m.cpu_system_pct = telem.cpu_system_pct
+    m.host_mem_increase_bytes = telem.host_mem_increase_bytes
+    m.disk_read_bytes = telem.disk_read_bytes
+    m.disk_read_bps = telem.disk_read_bps
+    m.read_char_bytes = telem.read_char_bytes
+    m.read_char_bps = telem.read_char_bps
+    m.gpu_util_pct = telem.gpu_util_pct
+    m.gpu_mem_used_bytes = telem.gpu_mem_used_bytes
+    m.nvlink_bytes = telem.nvlink_bytes
+    m.nvlink_bps = telem.nvlink_bps
     if result is None:
         m.wall_seconds = end - start
         return m

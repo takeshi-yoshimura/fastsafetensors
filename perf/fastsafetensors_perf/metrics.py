@@ -131,6 +131,24 @@ def aggregate_repetitions(
     storage_bytes_per_rep = []
     source_bytes_per_rep = []
 
+    # Telemetry, reduced across ranks per repetition. CPU / host-mem / disk /
+    # NVLink are host-or-node totals -> sum across ranks; GPU utilization is an
+    # average across the GPUs; GPU memory is the worst single device -> max.
+    def _get(rep, key):
+        return [m.get(key, 0) or 0 for m in rep]
+
+    telemetry_specs = {
+        "cpu_user_pct": sum,
+        "cpu_system_pct": sum,
+        "host_mem_increase_bytes": sum,
+        "disk_read_bps": sum,
+        "read_char_bps": sum,
+        "gpu_util_pct": lambda xs: (sum(xs) / len(xs)) if xs else 0.0,
+        "gpu_mem_used_bytes": max,
+        "nvlink_bps": sum,
+    }
+    telemetry_per_rep = {k: [] for k in telemetry_specs}
+
     for rep in rank_metrics_by_rep:
         if not rep:
             continue
@@ -143,12 +161,14 @@ def aggregate_repetitions(
         logical_bytes_per_rep.append(sum(m["logical_bytes"] for m in rep))
         storage_bytes_per_rep.append(sum(m["storage_bytes"] for m in rep))
         source_bytes_per_rep.append(sum(m["source_checkpoint_bytes"] for m in rep))
+        for key, reducer in telemetry_specs.items():
+            telemetry_per_rep[key].append(reducer(_get(rep, key)))
 
     wall_median = median(wall_per_rep) if wall_per_rep else 0.0
     logical_median = median(logical_bytes_per_rep) if logical_bytes_per_rep else 0.0
     source_median = median(source_bytes_per_rep) if source_bytes_per_rep else 0.0
 
-    return {
+    out = {
         "wall_seconds": summarize(wall_per_rep),
         "time_to_first_seconds": summarize(ttf_per_rep),
         "consumer_copy_seconds": summarize(copy_per_rep),
@@ -162,3 +182,6 @@ def aggregate_repetitions(
         "delivery_throughput_bps": (logical_median / wall_median) if wall_median > 0 else 0.0,
         "storage_throughput_bps": (source_median / wall_median) if wall_median > 0 else 0.0,
     }
+    for key in telemetry_specs:
+        out[key] = summarize(telemetry_per_rep[key])
+    return out

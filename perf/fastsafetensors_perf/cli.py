@@ -249,7 +249,9 @@ def report(results: List[str] = typer.Argument(..., help="one or more result JSO
            group_by: str = typer.Option("mode", "--group-by",
                                          help="comma-separated identity fields, e.g. mode or world_size"),
            metric: str = typer.Option("delivery_gbps", "--metric",
-                                       help="delivery_gbps|storage_gbps|wall_s|ttf_s|peak_cuda_gb|peak_rss_gb"),
+                                       help="delivery_gbps|storage_gbps|wall_s|ttf_s|peak_cuda_gb|"
+                                            "peak_rss_gb|disk_gbps|read_gbps|nvlink_gbps|gpu_util_pct|"
+                                            "gpu_mem_gb|cpu_user_pct|cpu_system_pct|mem_increase_gb"),
            baseline_field: Optional[str] = typer.Option(None, "--baseline-field"),
            baseline_value: Optional[str] = typer.Option(None, "--baseline-value"),
            json_out: bool = typer.Option(False, "--json", help="emit chart-ready JSON")):
