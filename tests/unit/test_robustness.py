@@ -132,13 +132,19 @@ def test_early_close_terminates_producer(input_files, framework):
     next(it)
     it.close()
 
+    def _leftover():
+        # Only non-daemon threads: the stranded producer is non-daemon (that
+        # is the bug), while e.g. tqdm's TMonitor daemon singleton may first
+        # spawn inside this test and legitimately outlive it.
+        return [t for t in threading.enumerate() if t not in before and not t.daemon]
+
     deadline = time.time() + 10
-    leftover = [t for t in threading.enumerate() if t not in before]
+    leftover = _leftover()
     while leftover and time.time() < deadline:
         time.sleep(0.05)
-        leftover = [t for t in threading.enumerate() if t not in before]
+        leftover = _leftover()
+    loader.close()  # before the assert: a failure must not leak into later tests
     assert not leftover, f"producer thread still alive: {leftover}"
-    loader.close()
 
 
 # ---- runtime GDS -> nogds fallback ----
