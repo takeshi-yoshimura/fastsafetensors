@@ -115,7 +115,7 @@ class NoGdsFileCopier(CopierInterface):
             self.fd = 0
         if len(failed) > 0:
             raise Exception(f"wait_io: wait_nogds_read failed, reqs={failed}")
-        return self.metadata.get_tensors(
+        return self.metadata._get_tensors(
             gbuf, self.device, self._base_off, dtype=dtype, names=self._chunk_names
         )
 

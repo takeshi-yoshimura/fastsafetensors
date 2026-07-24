@@ -18,6 +18,7 @@ except ImportError:
 
 
 from . import cpp as fstcpp
+from ._planner import plan_chunks
 from .common import SafeTensorsMetadata, SingleGroup
 from .frameworks import FrameworkOpBase
 from .loader import BaseSafeTensorsFileLoader, SafeTensorsFileLoader
@@ -171,7 +172,7 @@ class PipelineParallel:
         self.use_tqdm_on_load = use_tqdm_on_load
         # When set, each shard is loaded in sub-file chunks (span <= this many
         # bytes) so peak device buffer per rank is bounded regardless of shard
-        # size. See SafeTensorsMetadata.plan_chunks / CopierInterface.set_chunk.
+        # size. See _planner.plan_chunks / CopierInterface.set_chunk.
         self.max_batch_bytes = max_batch_bytes
 
         # Batch files (or, with max_batch_bytes, sub-file chunk-batches)
@@ -237,8 +238,10 @@ class PipelineParallel:
             planned = [
                 (
                     f,
-                    SafeTensorsMetadata.from_file(f, fw).plan_chunks(
-                        self.max_batch_bytes, keep_tensor=keep
+                    plan_chunks(
+                        SafeTensorsMetadata.from_file(f, fw),
+                        self.max_batch_bytes,
+                        keep_tensor=keep,
                     ),
                 )
                 for f in group
@@ -354,7 +357,7 @@ class PipelineParallel:
             with TimingContext("add_filenames", self._log_message, batch_id) as timer:
                 self.loader.add_filenames(rank_file_map)
                 if chunk_plan is not None:
-                    self.loader.set_chunk_plan(chunk_plan)
+                    self.loader._set_chunk_plan(chunk_plan)
             add_filenames_time = timer.elapsed_ms
 
             # For unbuffered behavior, wait for consumer to process previous item
@@ -527,7 +530,10 @@ class PipelineParallel:
             self._drain_queue()
             producer_thread.join(timeout=5)
             if producer_thread.is_alive():
-                self._log_error("producer thread did not exit within 5s")
+                self._log_error(
+                    "producer thread still running after close (it exits "
+                    "once any in-flight copy completes)"
+                )
             self._drain_queue()
 
     def close(self):

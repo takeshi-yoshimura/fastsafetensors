@@ -76,18 +76,26 @@ def test_chunk_plan_requires_set_chunk(input_files, framework):
     if framework.get_name() != "pytorch":
         pytest.skip("pytorch-only")
     from fastsafetensors import SafeTensorsFileLoader, SafeTensorsMetadata
+    from fastsafetensors._planner import plan_chunks
+    from fastsafetensors.copier.base import CopierInterface
 
     loader = SafeTensorsFileLoader(None, "cpu", nogds=True, framework="pytorch")
     loader.add_filenames({0: [input_files[0]]})
     meta = SafeTensorsMetadata.from_file(input_files[0], framework)
-    (chunk,) = meta.plan_chunks(meta.size_bytes)  # single whole-span chunk
-    loader.set_chunk_plan({input_files[0]: chunk})
+    (chunk,) = plan_chunks(meta, meta.size_bytes)  # single whole-span chunk
+    loader._set_chunk_plan({input_files[0]: chunk})
 
-    class _NoChunkCopier:  # e.g. gds/dstorage: no set_chunk support
-        def __init__(self, *a, **k):
-            pass
+    class _NoChunkCopier(CopierInterface):  # e.g. gds/dstorage: no set_chunk override
+        def __init__(self, metadata):
+            self.metadata = metadata
 
-    loader.copier_constructor = lambda m, d, f: _NoChunkCopier()
+        def submit_io(self, use_buf_register, max_copy_block_size):
+            raise AssertionError("chunk plan must be refused before any I/O")
+
+        def wait_io(self, gbuf, dtype=None, noalign=False):
+            raise AssertionError("chunk plan must be refused before any I/O")
+
+    loader.copier_constructor = lambda m, d, f: _NoChunkCopier(m)
     with pytest.raises(NotImplementedError, match="set_chunk"):
         loader.copy_files_to_device()
 

@@ -2,7 +2,7 @@
 
 import operator
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from .. import cpp as fstcpp
 from ..common import SafeTensorsMetadata
@@ -74,6 +74,21 @@ class CopierInterface(ABC):
         means full read.
         """
         validated_byte_ranges(self.metadata, byte_ranges)
+
+    def set_chunk(self, byte_ranges: List[Tuple[int, int]], names: Set[str]) -> None:
+        """Load only ``names``, allocating just those runs' span (sub-file
+        chunking for ``ParallelLoader(max_batch_bytes=...)``).
+
+        Unlike ``set_byte_ranges``, a chunk plan cannot be a no-op: silently
+        loading the whole file per chunk-batch would break the memory bound
+        and multiply full-file reads, so the default refuses. Partial-read
+        copiers (``nogds``, ``unified``) override this.
+        """
+        raise NotImplementedError(
+            f"sub-file chunking (max_batch_bytes) requires a copier that "
+            f"overrides set_chunk; {type(self).__name__} loads whole files. "
+            f"Use the nogds or unified copier, or unset max_batch_bytes."
+        )
 
     @abstractmethod
     def submit_io(

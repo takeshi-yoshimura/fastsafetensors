@@ -35,7 +35,7 @@ class LoaderConfig:
 
     # Cap peak device-buffer bytes per rank by loading each shard in sub-file
     # chunks (load -> [broadcast] -> release). None keeps whole-shard loading.
-    # Must be >= the largest single tensor. See SafeTensorsMetadata.plan_chunks.
+    # Must be >= the largest single tensor. See _planner.plan_chunks.
     max_batch_bytes: Optional[int] = None
 
     _extensions: Dict[str, Dict[str, Any]] = field(default_factory=dict)

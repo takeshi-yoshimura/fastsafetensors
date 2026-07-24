@@ -206,7 +206,7 @@ class UnifiedMemCopier(CopierInterface):
         # (not the header) into gbuf, so gbuf starts at a CUDA-allocator-aligned
         # address. The copy_start_offset=header_length cancels out in get_tensors'
         # pointer arithmetic, giving correct offsets. No memmove fixup needed.
-        tensors = self.metadata.get_tensors(
+        tensors = self.metadata._get_tensors(
             gbuf, self.device, self._base_off, dtype=dtype, names=self._chunk_names
         )
 
