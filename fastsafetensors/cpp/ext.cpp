@@ -988,9 +988,13 @@ cpp_metrics_t get_cpp_metrics() {
 // Reusable pinned 16MB bounce buffers, shared across dma_load_runs calls (and
 // concurrent producers). Chunked loading makes many small calls; recycling the
 // pinned buffers avoids a cudaHostAlloc/cudaFreeHost per chunk per thread.
+// Allocated portable (cudaHostAllocPortable / hipHostMallocPortable, both 0x1)
+// so a buffer first pinned under one device's context stays valid pinned
+// memory when a later call targets a different device.
 static std::mutex g_pin_mtx;
 static std::vector<void *> g_pin_pool;
 static const size_t PIN_CHUNK = 16UL << 20;
+static const unsigned int PIN_FLAG_PORTABLE = 0x1;
 
 static void *pin_acquire() {
     {
@@ -1002,7 +1006,8 @@ static void *pin_acquire() {
         }
     }
     void *p = nullptr;
-    if (cuda_fns.cudaHostAlloc(&p, PIN_CHUNK, 0) != cudaSuccess) return nullptr;
+    if (cuda_fns.cudaHostAlloc(&p, PIN_CHUNK, PIN_FLAG_PORTABLE) != cudaSuccess)
+        return nullptr;
     return p;
 }
 
@@ -1015,7 +1020,8 @@ static void pin_release(void *p) {
 static int dma_load_runs(uintptr_t gbuf_dev, const std::string &path,
                          size_t header_len,
                          const std::vector<size_t> &starts,
-                         const std::vector<size_t> &ends, int nthreads) {
+                         const std::vector<size_t> &ends, int nthreads,
+                         int device_id) {
     if (!cuda_fns.cudaHostAlloc || !cuda_fns.cudaMemcpy || !cuda_fns.cudaFreeHost
         || !cuda_fns.cudaDeviceSynchronize) {
         return -10;
@@ -1040,6 +1046,11 @@ static int dma_load_runs(uintptr_t gbuf_dev, const std::string &path,
                                           : (size_t)((double)(ti + 1) * total / nthreads);
         if (gbe <= gbs) continue;
         threads.emplace_back([&, gbs, gbe]() {
+            // The current CUDA device is thread-local and defaults to 0 in a
+            // fresh thread; select the loader's target before any CUDA call so
+            // contexts and copies land on the right device (device_id < 0 =
+            // caller doesn't know, e.g. cpu device: leave the default).
+            if (device_id >= 0) cuda_fns.cudaSetDevice(device_id);
             void *pinned = pin_acquire();
             if (!pinned) {
                 rc = -1;
@@ -1080,12 +1091,14 @@ static int dma_load_runs(uintptr_t gbuf_dev, const std::string &path,
                     if (fo_end >= fend) break;
                 }
             }
+            // Synchronize on this thread (its current device is the target);
+            // the calling thread may have a different device current.
+            cuda_fns.cudaDeviceSynchronize();
             close(fd);
             pin_release(pinned);
         });
     }
     for (auto &t : threads) t.join();
-    cuda_fns.cudaDeviceSynchronize();
     return rc.load();
 }
 
@@ -1134,13 +1147,15 @@ PYBIND11_MODULE(__MOD_NAME__, m)
         "dma_load_runs",
         [](uintptr_t gbuf_dev, const std::string &path, size_t header_len,
            const std::vector<size_t> &starts, const std::vector<size_t> &ends,
-           int nthreads) {
+           int nthreads, int device_id) {
             pybind11::gil_scoped_release release;  // blocking O_DIRECT + DMA
-            return dma_load_runs(gbuf_dev, path, header_len, starts, ends, nthreads);
+            return dma_load_runs(gbuf_dev, path, header_len, starts, ends,
+                                 nthreads, device_id);
         },
         pybind11::arg("gbuf_dev"), pybind11::arg("path"),
         pybind11::arg("header_len"), pybind11::arg("starts"),
-        pybind11::arg("ends"), pybind11::arg("nthreads") = 8);
+        pybind11::arg("ends"), pybind11::arg("nthreads") = 8,
+        pybind11::arg("device_id") = -1);
     m.def("get_cpp_metrics", &get_cpp_metrics);
     m.def("set_gil_release", &set_gil_release);
     m.def("get_gil_release", &get_gil_release);

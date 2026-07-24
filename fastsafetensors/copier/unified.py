@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from .. import cpp as fstcpp
 from ..common import SafeTensorsMetadata, get_fs_type, init_logger
 from ..frameworks import FrameworkOpBase, TensorBase
-from ..st_types import Device, DType
+from ..st_types import Device, DeviceType, DType
 from .base import CopierInterface, validated_byte_ranges
 from .registry import CopierConstructFunc, register_copier_constructor
 
@@ -150,6 +150,13 @@ class UnifiedMemCopier(CopierInterface):
         ):
             starts = [s for s, _ in runs]
             ends = [e for _, e in runs]
+            # The reader's worker threads must select this loader's device
+            # before any CUDA call (thread-local current device defaults to 0);
+            # -1 = cpu device, leave the workers' default untouched.
+            if self.device.type == DeviceType.CPU:
+                device_id = -1
+            else:
+                device_id = self.device.index if self.device.index is not None else 0
             rc = dma_load_runs(
                 gbuf.get_base_address(),
                 self.metadata.src,
@@ -157,6 +164,7 @@ class UnifiedMemCopier(CopierInterface):
                 starts,
                 ends,
                 self._dma_threads,
+                device_id,
             )
             if rc == 0:
                 return gbuf
