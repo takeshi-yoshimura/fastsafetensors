@@ -92,6 +92,47 @@ def test_chunk_plan_requires_set_chunk(input_files, framework):
         loader.copy_files_to_device()
 
 
+# ---- early consumer stop must not strand the producer thread ----
+
+
+def test_early_close_terminates_producer(input_files, framework):
+    """Stopping iteration mid-shard must unblock and end the producer thread.
+
+    With queue_size<=0 and max_batch_bytes expanding a shard into several
+    chunk-batches, a consumer that stops after the first tensor leaves the
+    producer waiting on consumer_processed / a full queue; close() must wake
+    it so the (non-daemon) thread exits and the process can terminate.
+    """
+    if framework.get_name() != "pytorch":
+        pytest.skip("pytorch-only")
+    import threading
+    import time
+
+    from fastsafetensors import ParallelLoader
+
+    before = set(threading.enumerate())
+    loader = ParallelLoader(
+        None,
+        [input_files[0]],
+        device="cpu",
+        nogds=True,
+        framework="pytorch",
+        queue_size=-1,
+        max_batch_bytes=256,  # fixture's largest tensor: several chunk-batches
+    )
+    it = loader.iterate_weights()
+    next(it)
+    it.close()
+
+    deadline = time.time() + 10
+    leftover = [t for t in threading.enumerate() if t not in before]
+    while leftover and time.time() < deadline:
+        time.sleep(0.05)
+        leftover = [t for t in threading.enumerate() if t not in before]
+    assert not leftover, f"producer thread still alive: {leftover}"
+    loader.close()
+
+
 # ---- runtime GDS -> nogds fallback ----
 
 

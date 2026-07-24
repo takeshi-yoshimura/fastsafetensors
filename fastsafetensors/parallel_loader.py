@@ -267,6 +267,45 @@ class PipelineParallel:
     def _log_error(self, message: str):
         self._log_message(message, is_error=True)
 
+    def _wait_consumer_processed(self) -> bool:
+        """Wait for the consumer to finish the previous batch, cancellable.
+
+        Returns False once cleanup has begun (stop_event set), so the producer
+        abandons the batch instead of blocking forever when the consumer stops
+        iterating mid-batch. The timeout only bounds how long a missed wakeup
+        could linger; cleanup also sets consumer_processed for an instant wakeup.
+        """
+        assert self.consumer_processed is not None
+        while not self.stop_event.is_set():
+            if self.consumer_processed.wait(timeout=0.1):
+                return not self.stop_event.is_set()
+        return False
+
+    def _put_cancellable(self, item: Union[FileBatch, Exception, None]) -> bool:
+        """Queue put that gives up once cleanup has begun.
+
+        A plain put() can block forever when the consumer stopped iterating
+        mid-batch (queue full, nobody left to get). Returns False if the item
+        was not delivered.
+        """
+        while not self.stop_event.is_set():
+            try:
+                self.batch_queue.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _drain_queue(self):
+        """Discard queued items, closing any file buffers the consumer never took."""
+        while True:
+            try:
+                item = self.batch_queue.get_nowait()
+            except queue.Empty:
+                return
+            if isinstance(item, FileBatch):
+                item.fb.close()
+
     def _spec_to_maps(self, spec: List[Any]):
         """Turn a batch spec into (rank_file_map, chunk_plan).
 
@@ -320,10 +359,8 @@ class PipelineParallel:
 
             # For unbuffered behavior, wait for consumer to process previous item
             if self.queue_size <= 0 and self.consumer_processed is not None:
-                if not self.consumer_processed.wait():
-                    raise TimeoutError(
-                        "can not waiting for consumer to process previous batch"
-                    )
+                if not self._wait_consumer_processed():
+                    return  # cleanup began; skip the batch
                 # Clear the event after wait to ensure next wait will block
                 self.consumer_processed.clear()
 
@@ -343,15 +380,17 @@ class PipelineParallel:
             batch.load_time = add_filenames_time + copy_time  # Total load time
 
             # Put into queue for consumer processing
-            if not self.stop_event.is_set():
-                self.batch_queue.put(batch)
+            if self._put_cancellable(batch):
                 with TimingContext("loader.reset", self._log_message, batch_id):
                     self.loader.reset()
+            else:
+                # Consumer is gone; release the batch's device memory.
+                fb.close()
 
         except Exception as e:
             self.error_info = f"Producer batch {batch_id} failed: {e}"
             self.error_event.set()
-            self.batch_queue.put(e)  # Notify consumer of error
+            self._put_cancellable(e)  # Notify consumer of error
 
     def _producer_worker(self):
         """Producer worker thread: responsible for copy_files_to_device operations.
@@ -374,10 +413,10 @@ class PipelineParallel:
             if not self.error_event.is_set():
                 self.error_info = f"Producer future failed: {e}"
                 self.error_event.set()
-                self.batch_queue.put(e)
+                self._put_cancellable(e)
 
         # Signal end of production
-        self.batch_queue.put(None)
+        self._put_cancellable(None)
 
     def _consume_single_batch(self):
         with TimingContext("wait_queue", self._log_message) as timer:
@@ -479,9 +518,17 @@ class PipelineParallel:
         try:
             yield from self._consumer_worker()
         finally:
-            # Cleanup work
+            # Cleanup: the consumer may stop mid-iteration (generator closed,
+            # exception), leaving the producer parked on consumer_processed or
+            # a full queue. Wake both so it observes stop_event and exits.
             self.stop_event.set()
+            if self.consumer_processed is not None:
+                self.consumer_processed.set()
+            self._drain_queue()
             producer_thread.join(timeout=5)
+            if producer_thread.is_alive():
+                self._log_error("producer thread did not exit within 5s")
+            self._drain_queue()
 
     def close(self):
         self.loader.close()
