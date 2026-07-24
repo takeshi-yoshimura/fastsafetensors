@@ -107,6 +107,18 @@ In the aggregate: CPU / host-mem / disk / read / NVLink **sum** across ranks
 (worst device). Report them with e.g. `--metric gpu_util_pct`, `--metric
 nvlink_gbps`, `--metric read_gbps`.
 
+### Resource time-series (`--trace`)
+
+`run --trace PATH` additionally writes the full sampled time-series (default
+20 ms) of one representative repetition as JSON — instantaneous CPU%, read/disk
+GB/s, GPU util/memory, host RSS, and NVLink GB/s versus seconds, one series per
+rank. It is a separate file from the JSONL results (traces are large and
+host-specific) and is meant for visualization, not the regression gate:
+
+```bash
+fastsafetensors-perf run /models/Qwen3-8B --mode vllm --trace trace.json
+```
+
 ### Baseline identity
 
 Two results may only be compared as the same series when **every** identity field

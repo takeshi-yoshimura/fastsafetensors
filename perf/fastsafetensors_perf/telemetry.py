@@ -137,10 +137,9 @@ class ResourceMonitor:
         self._nvml = _Nvml(device_index) if enable_nvml else None
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._util_samples: List[int] = []
-        self._mem_samples: List[int] = []
-        self._rss_samples: List[int] = []
+        self._raw: List[Dict[str, Optional[float]]] = []  # per-tick cumulative snapshots
         self.result = TelemetryResult()
+        self.trace_samples: List[Dict[str, float]] = []  # instantaneous time-series
 
     def __enter__(self) -> "ResourceMonitor":
         self.start()
@@ -155,19 +154,38 @@ class ResourceMonitor:
         self._io0 = _read_proc_io()
         self._rss0 = _read_rss_bytes()
         self._nvlink0 = self._nvml.nvlink_bytes() if self._nvml and self._nvml.ok else None
+        # Seed the trace with the start snapshot at t=0 so the first interval has
+        # a baseline for its instantaneous rates.
+        self._raw = [{
+            "t": 0.0, "rss": self._rss0, "util": None, "mem": None,
+            "cpu_user_s": self._ru0.ru_utime, "cpu_sys_s": self._ru0.ru_stime,
+            "read_bytes": (self._io0 or {}).get("read_bytes"),
+            "rchar": (self._io0 or {}).get("rchar"),
+            "nvlink": self._nvlink0,
+        }]
         self._stop.clear()
         self._thread = threading.Thread(target=self._sample_loop, daemon=True)
         self._thread.start()
 
+    def _snapshot(self) -> Dict[str, Optional[float]]:
+        ru = resource.getrusage(resource.RUSAGE_SELF)
+        io = _read_proc_io() or {}
+        u = m = None
+        nvl = None
+        if self._nvml and self._nvml.ok:
+            u, m = self._nvml.util_and_mem()
+            nvl = self._nvml.nvlink_bytes()
+        return {
+            "t": time.perf_counter() - self._t0, "rss": _read_rss_bytes(),
+            "util": u, "mem": m,
+            "cpu_user_s": ru.ru_utime, "cpu_sys_s": ru.ru_stime,
+            "read_bytes": io.get("read_bytes"), "rchar": io.get("rchar"),
+            "nvlink": nvl,
+        }
+
     def _sample_loop(self) -> None:
         while not self._stop.is_set():
-            self._rss_samples.append(_read_rss_bytes())
-            if self._nvml and self._nvml.ok:
-                u, m = self._nvml.util_and_mem()
-                if u is not None:
-                    self._util_samples.append(u)
-                if m is not None:
-                    self._mem_samples.append(m)
+            self._raw.append(self._snapshot())
             self._stop.wait(self.sample_interval)
 
     def stop(self) -> TelemetryResult:
@@ -184,7 +202,8 @@ class ResourceMonitor:
         r.cpu_user_pct = (ru1.ru_utime - self._ru0.ru_utime) / elapsed * 100.0
         r.cpu_system_pct = (ru1.ru_stime - self._ru0.ru_stime) / elapsed * 100.0
 
-        peak_rss = max(self._rss_samples) if self._rss_samples else _read_rss_bytes()
+        rss_samples = [s["rss"] for s in self._raw if s["rss"]]
+        peak_rss = max(rss_samples) if rss_samples else _read_rss_bytes()
         r.host_mem_increase_bytes = max(0, peak_rss - self._rss0)
 
         if self._io0 is not None and io1 is not None:
@@ -193,12 +212,43 @@ class ResourceMonitor:
             r.read_char_bytes = max(0, io1.get("rchar", 0) - self._io0.get("rchar", 0))
             r.read_char_bps = r.read_char_bytes / elapsed
 
-        if self._util_samples:
-            r.gpu_util_pct = sum(self._util_samples) / len(self._util_samples)
-        if self._mem_samples:
-            r.gpu_mem_used_bytes = max(self._mem_samples)
+        util_samples = [s["util"] for s in self._raw if s["util"] is not None]
+        mem_samples = [s["mem"] for s in self._raw if s["mem"] is not None]
+        if util_samples:
+            r.gpu_util_pct = sum(util_samples) / len(util_samples)
+        if mem_samples:
+            r.gpu_mem_used_bytes = max(mem_samples)
         if self._nvlink0 is not None and nvlink1 is not None:
             r.nvlink_bytes = max(0, nvlink1 - self._nvlink0)
             r.nvlink_bps = r.nvlink_bytes / elapsed
-        r.samples = len(self._rss_samples)
+        r.samples = len(self._raw)
+
+        self.trace_samples = self._build_trace()
         return r
+
+    def _build_trace(self) -> List[Dict[str, float]]:
+        """Instantaneous time-series from consecutive cumulative snapshots."""
+        def _rate(a, b, key) -> float:
+            if a.get(key) is None or b.get(key) is None:
+                return 0.0
+            return max(0.0, b[key] - a[key]) / dt
+
+        trace: List[Dict[str, float]] = []
+        for i in range(1, len(self._raw)):
+            a, b = self._raw[i - 1], self._raw[i]
+            dt = max(1e-6, b["t"] - a["t"])
+            trace.append({
+                "t": round(b["t"], 4),
+                "cpu_user_pct": round((b["cpu_user_s"] - a["cpu_user_s"]) / dt * 100.0, 1),
+                "cpu_system_pct": round((b["cpu_sys_s"] - a["cpu_sys_s"]) / dt * 100.0, 1),
+                "gpu_util_pct": float(b["util"]) if b["util"] is not None else 0.0,
+                "gpu_mem_gb": round(b["mem"] / 1e9, 3) if b["mem"] else 0.0,
+                "host_rss_gb": round(b["rss"] / 1e9, 3) if b["rss"] else 0.0,
+                "disk_gbps": round(_rate(a, b, "read_bytes") / 1e9, 3),
+                "read_gbps": round(_rate(a, b, "rchar") / 1e9, 3),
+                "nvlink_gbps": round(_rate(a, b, "nvlink") / 1e9, 3),
+            })
+        return trace
+
+    def trace(self) -> List[Dict[str, float]]:
+        return self.trace_samples

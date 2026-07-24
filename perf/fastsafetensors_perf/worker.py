@@ -53,6 +53,8 @@ class RunConfig:
     cache_policy: str = CACHE_COLD
     timeout_seconds: float = 600.0
     output: str = ""
+    trace_path: str = ""  # if set, write the resource time-series here
+    trace_sample_interval: float = 0.02
     options: LoaderOptions = field(default_factory=LoaderOptions)
 
     def resolved_case_id(self) -> str:
@@ -256,7 +258,8 @@ def _run_once_with_timeout(files: List[str], device: str, pg, options: LoaderOpt
 def _repetition(rep: int, dist: Dist, files: List[str], device: str,
                 config: RunConfig,
                 expected_names_digest: Optional[int] = None,
-                source_bytes_this_rank: int = 0) -> RankMetrics:
+                source_bytes_this_rank: int = 0):
+    """Run one repetition. Returns (RankMetrics, resource time-series samples)."""
     options = config.options
     # cold: evict before every recorded repetition; barrier so all ranks start
     # from the same cache state.
@@ -280,7 +283,8 @@ def _repetition(rep: int, dist: Dist, files: List[str], device: str,
     # Sample CPU/mem/disk/GPU/NVLink across the timed region. The sampler only
     # reads /proc and NVML (no CUDA/NCCL), so it is safe next to collectives.
     monitor = ResourceMonitor(device_index=_nvml_index(dist.local_rank),
-                              enable_nvml=device.startswith("cuda"))
+                              enable_nvml=device.startswith("cuda"),
+                              sample_interval=config.trace_sample_interval)
     monitor.start()
     start = from_time()
     result, status, error = _run_once_with_timeout(
@@ -290,6 +294,7 @@ def _repetition(rep: int, dist: Dist, files: List[str], device: str,
     # this rank's own time; the aggregate takes the slowest rank.
     end = from_time()
     telem = monitor.stop()
+    trace = monitor.trace()
     dist.barrier()
 
     m = RankMetrics(rank=dist.rank, repetition=rep, status=status, ok=(status == "ok"),
@@ -308,7 +313,7 @@ def _repetition(rep: int, dist: Dist, files: List[str], device: str,
     m.nvlink_bps = telem.nvlink_bps
     if result is None:
         m.wall_seconds = end - start
-        return m
+        return m, trace
 
     peak_alloc, peak_reserved = _peak_cuda(device)
     m.wall_seconds = end - start
@@ -331,7 +336,7 @@ def _repetition(rep: int, dist: Dist, files: List[str], device: str,
     m.requested_backend = result.requested_backend
     m.effective_backend = result.effective_backend
     m.fallback = result.fallback
-    return m
+    return m, trace
 
 
 # --- top-level case ---------------------------------------------------------
@@ -408,6 +413,7 @@ def run_case(config: RunConfig) -> int:
 
     # Recorded repetitions. Abort this rank's remaining reps after a timeout.
     my_metrics: List[RankMetrics] = []
+    my_trace: List[Dict[str, Any]] = []  # time-series of a representative rep
     aborted = False
     for rep in range(config.repeat):
         if aborted:
@@ -415,11 +421,14 @@ def run_case(config: RunConfig) -> int:
                                           status="timeout", ok=False,
                                           error="aborted after prior timeout"))
             continue
-        m = _repetition(rep, dist, files, device, config,
-                        expected_names_digest=expected_digest,
-                        source_bytes_this_rank=source_bytes_this_rank)
+        m, trace = _repetition(rep, dist, files, device, config,
+                               expected_names_digest=expected_digest,
+                               source_bytes_this_rank=source_bytes_this_rank)
         if m.status == "timeout":
             aborted = True
+        # Keep the last successful rep's trace (warm, representative).
+        if m.ok and trace:
+            my_trace = trace
         my_metrics.append(m)
 
     # Fill effective backend on the identity from the first successful rep.
@@ -433,6 +442,9 @@ def run_case(config: RunConfig) -> int:
     # Gather all ranks' metrics to everyone; rank 0 writes.
     gathered: List[List[Dict[str, Any]]] = dist.gather_objects(
         [m.to_dict() for m in my_metrics]
+    )
+    gathered_traces: List[List[Dict[str, Any]]] = (
+        dist.gather_objects(my_trace) if config.trace_path else [my_trace]
     )
 
     exit_code = 0
@@ -470,12 +482,42 @@ def run_case(config: RunConfig) -> int:
             os.makedirs(os.path.dirname(os.path.abspath(config.output)), exist_ok=True)
             write_records(config.output, records, append=True)
 
+        if config.trace_path:
+            _write_trace(config, ident, gathered_traces, stats)
+
         _print_summary(config, ident, stats, worst_status)
         if worst_status != "ok":
             exit_code = 1
 
     _teardown(dist)
     return exit_code
+
+
+def _write_trace(config: RunConfig, ident: Identity,
+                 gathered_traces: List[List[Dict[str, Any]]],
+                 stats: Dict[str, Any]) -> None:
+    """Write the resource time-series (one series per rank) as JSON."""
+    import json
+
+    doc = {
+        "schema": "trace-1",
+        "case_id": config.resolved_case_id(),
+        "identity": {
+            "model_alias": ident.model_alias, "mode": ident.mode,
+            "consumer": ident.consumer, "world_size": ident.world_size,
+            "backend": ident.backend, "cache_policy": ident.cache_policy,
+            "gpu_model": ident.gpu_model,
+        },
+        "wall_seconds_median": stats.get("wall_seconds", {}).get("median", 0.0),
+        "sample_interval": config.trace_sample_interval,
+        "ranks": [
+            {"rank": r, "samples": samples}
+            for r, samples in enumerate(gathered_traces)
+        ],
+    }
+    os.makedirs(os.path.dirname(os.path.abspath(config.trace_path)), exist_ok=True)
+    with open(config.trace_path, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh)
 
 
 def _rank_metrics_from_dict(md: Dict[str, Any]) -> RankMetrics:
@@ -535,6 +577,8 @@ def _build_arg_parser():
     run.add_argument("--warmup", type=int, default=0)
     run.add_argument("--timeout", type=float, default=600.0)
     run.add_argument("--output", default="")
+    run.add_argument("--trace", default="", help="write resource time-series JSON here")
+    run.add_argument("--trace-interval", type=float, default=0.02)
     return p
 
 
@@ -550,7 +594,8 @@ def config_from_namespace(ns) -> RunConfig:
         model_revision=ns.model_revision, hardware_profile=ns.hardware_profile,
         case_id=ns.case_id, world_size=world_size, repeat=ns.repeat,
         warmup=ns.warmup, cache_policy=ns.cache, timeout_seconds=ns.timeout,
-        output=ns.output, options=options,
+        output=ns.output, trace_path=ns.trace, trace_sample_interval=ns.trace_interval,
+        options=options,
     )
 
 

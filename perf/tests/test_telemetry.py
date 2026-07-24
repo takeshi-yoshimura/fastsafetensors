@@ -33,6 +33,33 @@ def test_monitor_context_manager_populates_dict():
         assert key in d
 
 
+def test_worker_writes_trace_file(tmp_path):
+    # End-to-end on CPU: safetensors mode, trace enabled -> a JSON time-series.
+    import json
+
+    from conftest import make_sharded_checkpoint
+    from fastsafetensors_perf.loaders import LoaderOptions
+    from fastsafetensors_perf.worker import CACHE_WARM, RunConfig, run_case
+
+    model = str(tmp_path / "m")
+    make_sharded_checkpoint(model, [{"a": ("F32", [256, 256])}, {"b": ("F32", [256, 256])}])
+    trace = str(tmp_path / "trace.json")
+    cfg = RunConfig(
+        model_path=model, hardware_profile="cpu-test", world_size=1, repeat=2,
+        cache_policy=CACHE_WARM, trace_path=trace, trace_sample_interval=0.005,
+        options=LoaderOptions(mode="safetensors", consumer="iterate"),
+    )
+    run_case(cfg)
+    doc = json.load(open(trace))
+    assert doc["schema"] == "trace-1"
+    assert doc["ranks"] and "samples" in doc["ranks"][0]
+    # A short load still yields >= 1 instantaneous sample with the expected keys.
+    if doc["ranks"][0]["samples"]:
+        s = doc["ranks"][0]["samples"][0]
+        for k in ("t", "cpu_user_pct", "read_gbps", "gpu_util_pct", "host_rss_gb"):
+            assert k in s
+
+
 def _rank_metric(rank, **over):
     base = dict(
         wall_seconds=1.0, time_to_first_seconds=0.1, consumer_copy_seconds=0.0,

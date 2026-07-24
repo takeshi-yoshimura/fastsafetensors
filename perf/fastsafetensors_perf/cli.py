@@ -85,7 +85,7 @@ def inspect(model: str = typer.Argument(..., help="model directory or .safetenso
 def _launch_torchrun(model_path: str, opts: LoaderOptions, world_size: int,
                      cache: str, repeat: int, warmup: int, timeout: float,
                      output: str, model_alias: str, model_revision: str,
-                     hardware_profile: str, case_id: str) -> int:
+                     hardware_profile: str, case_id: str, trace: str = "") -> int:
     cmd = [
         "torchrun", "--standalone", f"--nproc-per-node={world_size}",
         "-m", "fastsafetensors_perf.worker", "run", model_path,
@@ -101,6 +101,8 @@ def _launch_torchrun(model_path: str, opts: LoaderOptions, world_size: int,
         cmd.append("--nogds")
     if output:
         cmd += ["--output", output]
+    if trace:
+        cmd += ["--trace", trace]
     if case_id:
         cmd += ["--case-id", case_id]
     env = dict(os.environ)
@@ -124,6 +126,8 @@ def run(model: str = typer.Argument(...),
         warmup: int = typer.Option(0, "--warmup"),
         timeout: float = typer.Option(600.0, "--timeout"),
         output: str = typer.Option("", "--output"),
+        trace: str = typer.Option("", "--trace", help="write resource time-series JSON here"),
+        trace_interval: float = typer.Option(0.02, "--trace-interval"),
         models: Optional[str] = typer.Option(None, "--models", help="model alias map json"),
         model_root: Optional[str] = typer.Option(None, "--model-root"),
         hardware_profile: str = typer.Option("unknown", "--hardware-profile")):
@@ -137,14 +141,16 @@ def run(model: str = typer.Argument(...),
     if world_size > 1:
         code = _launch_torchrun(
             resolved["path"], opts, world_size, cache, repeat, warmup, timeout,
-            output, resolved["alias"], resolved["revision"], hardware_profile, "")
+            output, resolved["alias"], resolved["revision"], hardware_profile, "",
+            trace=trace)
         raise typer.Exit(code)
 
     config = RunConfig(
         model_path=resolved["path"], model_alias=resolved["alias"],
         model_revision=resolved["revision"], hardware_profile=hardware_profile,
         world_size=1, repeat=repeat, warmup=warmup, cache_policy=cache,
-        timeout_seconds=timeout, output=output, options=opts,
+        timeout_seconds=timeout, output=output, trace_path=trace,
+        trace_sample_interval=trace_interval, options=opts,
     )
     raise typer.Exit(run_case(config))
 
