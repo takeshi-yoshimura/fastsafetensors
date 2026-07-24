@@ -76,10 +76,14 @@ class FilesBufferOnDevice:
         self.framework = framework
         self.rank_loaders: Dict[int, List[LazyTensorFactory]] = rank_loaders
         self.key_to_rank_lidx: Dict[str, Tuple[int, int]] = {}
-        self.instantiated: Dict[int, Dict[int, Dict[str, bool]]] = {}  # rank, key name
+        # Registered (available-at-load) names per factory, so each factory only
+        # retains references to the tensors reachable through this buffer. This
+        # replaces the old per-(rank, lidx) `instantiated` count check, which
+        # compared against the full file metadata and mis-tracked filtered loads.
+        factory_names: Dict[Tuple[int, int], set] = {}
         for rank, loaders in rank_loaders.items():
-            self.instantiated[rank] = {}
             for lidx, loader in enumerate(loaders):
+                names = factory_names.setdefault((rank, lidx), set())
                 for key in loader.metadata.tensors.keys():
                     if keep_tensor is not None and not keep_tensor(key):
                         continue
@@ -88,12 +92,20 @@ class FilesBufferOnDevice:
                             f"FilesBufferOnDevice: key {key} must be unique among files"
                         )
                     self.key_to_rank_lidx[key] = (rank, lidx)
-                self.instantiated[rank][lidx] = {}
+                    names.add(key)
+        for (rank, lidx), names in factory_names.items():
+            rank_loaders[rank][lidx].retain_only(names)
         # Names consumed via get_and_remove_tensor()/drain_tensors().
         # Availability state, kept separate from the immutable key_to_rank_lidx
         # metadata so that metadata lookups keep working after a name is consumed.
         self._consumed_keys: Set[str] = set()
         self.pg = pg
+        # auto_mem_delete eagerly drops internal references as tensors are handed
+        # out (reusable access then cannot re-request the same name). It stays
+        # gated to distributed groups for backward compatibility -- single-group
+        # zero-copy access keeps names reusable until close. This flag is
+        # transitional and is superseded by consuming access
+        # (get_and_remove_*/drain_tensors); it is slated for deprecation.
         self.auto_mem_delete = auto_mem_delete and self.pg.size() > 1
 
     def close(self):
@@ -152,6 +164,15 @@ class FilesBufferOnDevice:
             )
         return rank_lidx
 
+    def _release_internal(self, rank: int, lidx: int, tensor_name: str) -> None:
+        """Drop the factory's internal reference to a handed-out tensor.
+
+        The physical buffer is released only when the factory's retained set
+        drains and no exported tensor still references it (shared ownership);
+        there is no explicit last-tensor free.
+        """
+        self.rank_loaders[rank][lidx].drop_internal_reference(tensor_name)
+
     def _get_tensor(
         self,
         rank: int,
@@ -160,18 +181,12 @@ class FilesBufferOnDevice:
         ret: TensorBase,
         device: Optional[Device],
         dtype: DType,
+        consume: bool = False,
     ) -> TensorBase:
-        loader = self.rank_loaders[rank][lidx]
-        if self.auto_mem_delete:
-            self.instantiated[rank][lidx][tensor_name] = True
-            if len(self.instantiated[rank][lidx]) == len(loader.metadata.tensors):
-                if self.pg.rank() == rank:
-                    logger.debug(
-                        "_get_tensor: free_dev_ptrs, lidx=%d, src=%s",
-                        lidx,
-                        loader.metadata.src,
-                    )
-                loader.free_dev_ptrs()
+        # Consuming access always transfers ownership out of the buffer;
+        # auto_mem_delete does the same eagerly for reusable access.
+        if consume or self.auto_mem_delete:
+            self._release_internal(rank, lidx, tensor_name)
         return ret.to(device=device, dtype=dtype)
 
     def get_sharded_wrapped(
@@ -180,16 +195,19 @@ class FilesBufferOnDevice:
         dim: int,
         device: Optional[Device] = None,
         dtype: DType = DType.AUTO,
+        consume: bool = False,
     ) -> TensorBase:
         """Return a wrapped shard of tensor_name.
 
         The returned tensor keeps its backing allocation alive, so it stays
         valid after close(). Raises TensorConsumedError if the name was already
-        consumed via get_and_remove_tensor()/drain_tensors().
+        consumed via get_and_remove_tensor()/drain_tensors(). When *consume* is
+        True the factory's internal reference is dropped (see
+        get_and_remove_sharded_wrapped).
         """
         rank, lidix = self._require_available(tensor_name)
         t = self.rank_loaders[rank][lidix].shuffle(self.pg, tensor_name, dim)
-        return self._get_tensor(rank, lidix, tensor_name, t, device, dtype)
+        return self._get_tensor(rank, lidix, tensor_name, t, device, dtype, consume)
 
     def get_sharded(
         self,
@@ -256,7 +274,7 @@ class FilesBufferOnDevice:
         """
         # get_sharded_wrapped runs _require_available first, so a consumed or
         # unknown name raises here before we mark anything.
-        t = self.get_sharded_wrapped(tensor_name, -1, device, dtype)
+        t = self.get_sharded_wrapped(tensor_name, -1, device, dtype, consume=True)
         self._consumed_keys.add(tensor_name)
         return t
 
@@ -273,6 +291,34 @@ class FilesBufferOnDevice:
         available.
         """
         return self.get_and_remove_tensor_wrapped(tensor_name, device, dtype).get_raw()
+
+    def get_and_remove_sharded_wrapped(
+        self,
+        tensor_name: str,
+        dim: int,
+        device: Optional[Device] = None,
+        dtype: DType = DType.AUTO,
+    ) -> TensorBase:
+        """Consuming counterpart of get_sharded_wrapped().
+
+        Returns the wrapped shard and marks the name consumed (see
+        get_and_remove_tensor_wrapped for the consuming contract).
+        """
+        t = self.get_sharded_wrapped(tensor_name, dim, device, dtype, consume=True)
+        self._consumed_keys.add(tensor_name)
+        return t
+
+    def get_and_remove_sharded(
+        self,
+        tensor_name: str,
+        dim: int,
+        device: Optional[Device] = None,
+        dtype: DType = DType.AUTO,
+    ) -> Any:
+        """Consuming counterpart of get_sharded()."""
+        return self.get_and_remove_sharded_wrapped(
+            tensor_name, dim, device, dtype
+        ).get_raw()
 
     def push_tensor(
         self,
@@ -303,11 +349,13 @@ class FilesBufferOnDevice:
         dim: int,
         device: Optional[Device] = None,
         dtype: DType = DType.AUTO,
+        consume: bool = False,
     ) -> TensorBase:
         """Return concatenated column shards from tensor_names.
 
         The returned tensor keeps its backing allocation alive, so it stays
-        valid after close().
+        valid after close(). When *consume* is True the input names' internal
+        references are dropped (see get_and_remove_multi_cols).
         """
         rank_lidixs: Dict[Tuple[int, int], List[str]] = {}
         for tensor_name in tensor_names:
@@ -323,25 +371,34 @@ class FilesBufferOnDevice:
             )
         if len(ts) == 1:
             # fastpath: tensors at the same layer are often in the same file
-            return self._get_tensor(
-                rank, lidix, rank_lidixs[(rank, lidix)][0], ts[0], device, dtype
-            )
-        ret = self.framework.concat_tensors(ts, dim=dim)
-        if self.auto_mem_delete:
+            ret = ts[0]
+        else:
+            ret = self.framework.concat_tensors(ts, dim=dim)
+        # The result is an independent (concatenated/sharded) tensor; drop every
+        # input name's internal reference so the source buffers can be released
+        # by shared ownership. Applies to all names, not just the first.
+        if consume or self.auto_mem_delete:
             for tensor_name in tensor_names:
                 rank, lidx = self._get_rank_lidx(tensor_name)
-                loader = self.rank_loaders[rank][lidx]
-                self.instantiated[rank][lidx][tensor_name] = True
-                if len(self.instantiated[rank][lidx]) == len(loader.metadata.tensors):
-                    if self.pg.rank() == rank:
-                        logger.debug(
-                            "get_multi_cols: free_dev_ptrs, rank=%d, lidx=%d, src=%s",
-                            rank,
-                            lidx,
-                            loader.metadata.src,
-                        )
-                    loader.free_dev_ptrs()
+                self._release_internal(rank, lidx, tensor_name)
         return ret.to(device=device, dtype=dtype)
+
+    def get_and_remove_multi_cols(
+        self,
+        tensor_names: List[str],
+        dim: int,
+        device: Optional[Device] = None,
+        dtype: DType = DType.AUTO,
+    ) -> TensorBase:
+        """Consuming counterpart of get_multi_cols().
+
+        Marks every input name consumed after the concatenation completes.
+        """
+        for tensor_name in tensor_names:
+            self._require_available(tensor_name)
+        ret = self.get_multi_cols(tensor_names, dim, device, dtype, consume=True)
+        self._consumed_keys.update(tensor_names)
+        return ret
 
     def as_dict(self, tensor_shard_dim: OrderedDict[str, int]) -> Dict[str, TensorBase]:
         """Return tensors keyed by name according to the requested shard dims.
@@ -354,14 +411,9 @@ class FilesBufferOnDevice:
             rank, lidx = self._require_available(tensor_name)
             loader = self.rank_loaders[rank][lidx]
             tensors[tensor_name] = loader.shuffle(self.pg, tensor_name, dim)
+            # The returned tensor (a distributed shard, or a zero-copy view that
+            # keeps its own allocation reference) lets us drop the factory's
+            # internal reference under auto_mem_delete.
             if self.auto_mem_delete:
-                self.instantiated[rank][lidx][tensor_name] = True
-                if len(self.instantiated[rank][lidx]) == len(loader.metadata.tensors):
-                    if self.pg.rank() == rank:
-                        logger.debug(
-                            "as_dict: free_dev_ptrs, rank=%d, src=%s",
-                            rank,
-                            loader.metadata.src,
-                        )
-                    loader.free_dev_ptrs()
+                self._release_internal(rank, lidx, tensor_name)
         return tensors

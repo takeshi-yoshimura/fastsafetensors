@@ -274,6 +274,41 @@ class LazyTensorFactory:
         pg.scatter(dst, scatter_list=scatter_list, src=self.rank)
         return dst
 
+    def retain_only(self, names: "set[str]") -> None:
+        """Drop internal tensor references not in *names*.
+
+        Called once after construction so the factory only keeps references to
+        the tensors that are actually available in the owning buffer (e.g. after
+        a tensor filter). Dropped tensors were materialized but never accessible;
+        releasing their DLPack owners here reclaims those references early and
+        lets the buffer-side allocation be released once the retained set drains.
+        """
+        if not self.tensors:
+            return
+        for name in [n for n in self.tensors if n not in names]:
+            del self.tensors[name]
+
+    def drop_internal_reference(self, name: str) -> None:
+        """Release the factory's internal reference to *name*'s tensor.
+
+        Used when a name is consumed (get_and_remove_*) or handed out under
+        auto_mem_delete. Once the factory holds no more internal references, its
+        buffer-side allocation reference is released so shared ownership alone
+        decides when the physical buffer is freed: exported tensors that still
+        reference it keep it alive; otherwise it is freed now. There is no
+        explicit "last tensor" free call -- release follows from the reference
+        count reaching zero.
+        """
+        self.tensors.pop(name, None)
+        if not self.tensors and self.allocation is not None:
+            logger.debug(
+                "drop_internal_reference: release buf, addr=0x%x",
+                self.allocation.get_base_address() if self.allocation.live else 0,
+            )
+            self.allocation.release()
+            self.allocation = None
+            self.gbuf = None
+
     def free_dev_ptrs(self):
         """Release this factory's reference to the backing allocation.
 
