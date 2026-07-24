@@ -330,7 +330,7 @@ class fastsafe_open:
         return ret
 
     def keys(self) -> List[str]:
-        return list(self.fb.key_to_rank_lidx.keys())
+        return self.fb.keys()
 
     def get_tensor_wrapped(self, name: str) -> TensorBase:
         """Return a wrapped tensor by name.

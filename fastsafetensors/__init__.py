@@ -17,6 +17,6 @@ from .ep_slice import (
     expert_parallel_filter_from_env,
     owned_expert_range,
 )
-from .file_buffer import FilesBufferOnDevice
+from .file_buffer import FilesBufferOnDevice, TensorConsumedError
 from .loader import SafeTensorsFileLoader, fastsafe_open
 from .parallel_loader import ParallelLoader

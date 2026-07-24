@@ -5,6 +5,7 @@
 # to add from_cuda_buffer()
 
 import ctypes
+import sys
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from .st_types import Device, DeviceType, DType
@@ -242,7 +243,10 @@ def _numpy_buffer_deleter(handle: Union[int, ctypes.c_void_p]) -> None:
     # frees the backing memory only once the last reference is gone.
     holder = py_obj.value
     owner = getattr(holder, "owner", None)
-    if owner is not None:
+    # Skip the release during interpreter shutdown: freeing device memory then
+    # is pointless (the process/CUDA context tears it down anyway) and the
+    # framework's free path may touch already-finalized module globals.
+    if owner is not None and not sys.is_finalizing():
         owner.release()
     ctypes.pythonapi.Py_DecRef(py_obj)
     ctypes.pythonapi.Py_DecRef(ctypes.py_object(py_obj_ptr))

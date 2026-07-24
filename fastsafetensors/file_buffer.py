@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from collections import OrderedDict
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from .common import init_logger
 from .frameworks import FrameworkOpBase, ProcessGroupBase, TensorBase
@@ -9,6 +9,23 @@ from .st_types import Device, DType
 from .tensor_factory import LazyTensorFactory
 
 logger = init_logger(__name__)
+
+
+class TensorConsumedError(ValueError):
+    """Raised when a tensor name is requested after it has been consumed.
+
+    A name is consumed by ``get_and_remove_tensor()`` /
+    ``get_and_remove_tensor_wrapped()`` (and, in a later PR, ``drain_tensors()``).
+    Consuming access hands the caller sole ownership of the name, so any
+    subsequent reusable (``get_tensor``) or consuming (``get_and_remove_tensor``)
+    acquisition of the same name fails with this error. It subclasses
+    ``ValueError`` so existing ``except ValueError`` handlers around tensor
+    acquisition keep working, while callers that want to distinguish "already
+    consumed" from "unknown name" can catch this type.
+
+    Metadata queries such as ``get_shape`` / ``get_filename`` remain valid after
+    consumption and do not raise.
+    """
 
 
 class FilesBufferOnDevice:
@@ -24,6 +41,15 @@ class FilesBufferOnDevice:
         device allocation, so they remain valid after close(). The physical
         memory is released only once the buffer and every exported tensor are
         gone.
+
+        Acquisition comes in two flavors. Reusable access (get_tensor(),
+        get_sharded(), ...) leaves the name available to request again.
+        Consuming access (get_and_remove_tensor()) hands over the name once:
+        after it succeeds the name is removed from keys() and any further
+        reusable or consuming acquisition of that name raises
+        TensorConsumedError. Use keys() for the names still available and
+        all_keys() for every registered name (metadata stays queryable after
+        consumption).
 
     Args:
         rank_loaders (Dict<rank, list(LazyTensorFacotry)>): Tensor factories per rank, which hold device pointers for buffers.
@@ -63,6 +89,10 @@ class FilesBufferOnDevice:
                         )
                     self.key_to_rank_lidx[key] = (rank, lidx)
                 self.instantiated[rank][lidx] = {}
+        # Names consumed via get_and_remove_tensor()/drain_tensors().
+        # Availability state, kept separate from the immutable key_to_rank_lidx
+        # metadata so that metadata lookups keep working after a name is consumed.
+        self._consumed_keys: Set[str] = set()
         self.pg = pg
         self.auto_mem_delete = auto_mem_delete and self.pg.size() > 1
 
@@ -78,6 +108,23 @@ class FilesBufferOnDevice:
                 loader.free_dev_ptrs()
         self.rank_loaders = {}
 
+    def keys(self) -> List[str]:
+        """Return the tensor names still available for acquisition.
+
+        Excludes names already consumed via get_and_remove_tensor()/
+        drain_tensors(). This is the preferred way to enumerate a buffer's
+        tensors; prefer it over reaching into ``key_to_rank_lidx`` directly.
+        """
+        return [k for k in self.key_to_rank_lidx if k not in self._consumed_keys]
+
+    def all_keys(self) -> List[str]:
+        """Return every registered tensor name, including consumed ones.
+
+        Backed by immutable metadata, so consumed names remain listed here and
+        their get_shape()/get_filename() lookups keep working.
+        """
+        return list(self.key_to_rank_lidx.keys())
+
     def get_filename(self, tensor_name: str) -> str:
         rank, lidx = self._get_rank_lidx(tensor_name)
         return self.rank_loaders[rank][lidx].metadata.src
@@ -90,6 +137,20 @@ class FilesBufferOnDevice:
         if tensor_name not in self.key_to_rank_lidx:
             raise ValueError(f"_get_rank: key {tensor_name} was not found in files")
         return self.key_to_rank_lidx[tensor_name]
+
+    def _require_available(self, tensor_name: str) -> Tuple[int, int]:
+        """Validate that *tensor_name* can still be acquired.
+
+        Raises ValueError if the name was never registered (or was filtered
+        out) and TensorConsumedError if it has already been consumed. Returns
+        the (rank, lidx) so callers can reuse the lookup.
+        """
+        rank_lidx = self._get_rank_lidx(tensor_name)
+        if tensor_name in self._consumed_keys:
+            raise TensorConsumedError(
+                f"tensor {tensor_name} was consumed and is no longer available"
+            )
+        return rank_lidx
 
     def _get_tensor(
         self,
@@ -123,9 +184,10 @@ class FilesBufferOnDevice:
         """Return a wrapped shard of tensor_name.
 
         The returned tensor keeps its backing allocation alive, so it stays
-        valid after close().
+        valid after close(). Raises TensorConsumedError if the name was already
+        consumed via get_and_remove_tensor()/drain_tensors().
         """
-        rank, lidix = self._get_rank_lidx(tensor_name)
+        rank, lidix = self._require_available(tensor_name)
         t = self.rank_loaders[rank][lidix].shuffle(self.pg, tensor_name, dim)
         return self._get_tensor(rank, lidix, tensor_name, t, device, dtype)
 
@@ -174,6 +236,44 @@ class FilesBufferOnDevice:
         """
         return self.get_tensor_wrapped(tensor_name, device, dtype).get_raw()
 
+    def get_and_remove_tensor_wrapped(
+        self,
+        tensor_name: str,
+        device: Optional[Device] = None,
+        dtype: DType = DType.AUTO,
+    ) -> TensorBase:
+        """Consuming counterpart of get_tensor_wrapped().
+
+        Returns the wrapped tensor and marks the name consumed: it is removed
+        from keys() and any later reusable or consuming acquisition of the same
+        name raises TensorConsumedError. The returned tensor retains shared
+        ownership of the backing allocation, so no lifetime-related clone is
+        required and it stays valid after close().
+
+        The name is marked consumed only after the tensor is materialized (and,
+        for distributed loads, after the collective completes) successfully; if
+        acquisition raises, the name stays available for retry.
+        """
+        # get_sharded_wrapped runs _require_available first, so a consumed or
+        # unknown name raises here before we mark anything.
+        t = self.get_sharded_wrapped(tensor_name, -1, device, dtype)
+        self._consumed_keys.add(tensor_name)
+        return t
+
+    def get_and_remove_tensor(
+        self,
+        tensor_name: str,
+        device: Optional[Device] = None,
+        dtype: DType = DType.AUTO,
+    ) -> Any:
+        """Consuming counterpart of get_tensor(); see get_and_remove_tensor_wrapped().
+
+        Prefer this over get_tensor() for one-shot access: it makes the intent
+        to consume explicit and lets the buffer report the name as no longer
+        available.
+        """
+        return self.get_and_remove_tensor_wrapped(tensor_name, device, dtype).get_raw()
+
     def push_tensor(
         self,
         tensor_name: str,
@@ -189,7 +289,7 @@ class FilesBufferOnDevice:
         The returned tensor keeps its backing allocation alive, so it stays
         valid after close().
         """
-        rank, lidix = self._get_rank_lidx(tensor_name)
+        rank, lidix = self._require_available(tensor_name)
         t = self.rank_loaders[rank][lidix].push(self.pg, tensor_name, dst_rank, rank)
         if t:
             return self._get_tensor(
@@ -211,7 +311,7 @@ class FilesBufferOnDevice:
         """
         rank_lidixs: Dict[Tuple[int, int], List[str]] = {}
         for tensor_name in tensor_names:
-            ranklidx = self._get_rank_lidx(tensor_name)
+            ranklidx = self._require_available(tensor_name)
             if ranklidx in rank_lidixs:
                 rank_lidixs[ranklidx].append(tensor_name)
             else:
@@ -251,7 +351,7 @@ class FilesBufferOnDevice:
         """
         tensors: Dict[str, TensorBase] = {}
         for tensor_name, dim in tensor_shard_dim.items():
-            rank, lidx = self._get_rank_lidx(tensor_name)
+            rank, lidx = self._require_available(tensor_name)
             loader = self.rank_loaders[rank][lidx]
             tensors[tensor_name] = loader.shuffle(self.pg, tensor_name, dim)
             if self.auto_mem_delete:
