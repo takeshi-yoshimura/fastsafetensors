@@ -30,10 +30,13 @@ without vLLM. Only `mode=vllm` / `vllm-model-load` require the `vllm` extra.
 # Header-only inventory: shards, tensors, dtype histogram, logical/storage bytes.
 fastsafetensors-perf inspect /models/Qwen3-8B
 
-# Single case (single GPU). Emits rank + aggregate JSONL records.
+# Single case (single GPU). Emits rank + aggregate JSONL records and a
+# resource time-series. Both default under .report/ (see "Output layout").
 fastsafetensors-perf run /models/Qwen3-8B \
-  --mode vllm --consumer copy --queue-size 0 \
-  --cache cold --repeat 5 --output results/a100-qwen3-8b.jsonl
+  --mode vllm --consumer copy --queue-size 0 --cache cold --repeat 5
+
+# Render a standalone HTML report (fixed design) from whatever is in .report/:
+fastsafetensors-perf html
 
 # Multi-GPU via the standard launcher (respects CUDA_VISIBLE_DEVICES):
 torchrun --standalone --nproc-per-node=4 \
@@ -60,6 +63,30 @@ cache, model) to answer "how much faster is X than Y?", e.g. safetensors vs
 fastsafetensors, or 1- vs 2-GPU scaling. `--json` emits chart-ready series. The
 same JSONL feeds both, so data collected for regression testing is reusable for
 a performance write-up.
+
+## Output layout
+
+By default everything lands under **`.report/`** (git-ignored):
+
+| Path | What |
+|---|---|
+| `.report/results.jsonl` | rank + aggregate records (appended by `run`) |
+| `.report/traces/<case>.json` | per-case resource time-series (`run` writes one; `--no-trace` to skip) |
+| `.report/index.html` | the report `fastsafetensors-perf html` renders |
+
+`--output` / `--trace-path` / `--output-dir` override the locations. `matrix`
+also defaults its output under `.report/`.
+
+### The HTML report is generated, not hand-authored
+
+`fastsafetensors-perf html [RESULTS...] [--traces DIR] [--output FILE]` reads the
+JSONL results and `--trace` series and emits **one self-contained HTML file** with
+a fixed design baked into the package (`htmlreport.py`): throughput bars,
+tensor-parallel scaling, a resource **timeline** (small multiples with a real
+y-axis and a synced hover cursor), a detail table, and an auto-filled methodology
+block. Everything — chips, KPIs, speedups, versions — is derived from the records,
+so the report is reproducible from the CLI rather than written by hand. With no
+arguments it reads `.report/` and writes `.report/index.html`.
 
 ## Benchmark modes
 

@@ -15,7 +15,11 @@ from typing import Any, Dict, List, Optional
 
 import typer
 
+import glob
+import re
+
 from . import compare as compare_mod
+from . import htmlreport as htmlreport_mod
 from . import report as report_mod
 from .loaders import LoaderOptions
 from .models import inspect_checkpoint
@@ -23,6 +27,15 @@ from .results import iter_records
 from .worker import CACHE_COLD, RunConfig, run_case
 
 app = typer.Typer(add_completion=False, help="fastsafetensors regression benchmark")
+
+# Default output location for results, traces, and the HTML report.
+REPORT_DIR = ".report"
+DEFAULT_RESULTS = f"{REPORT_DIR}/results.jsonl"
+
+
+def _slug(*parts: object) -> str:
+    s = "-".join(str(p) for p in parts)
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", s).strip("-")
 
 
 # --- model alias resolution -------------------------------------------------
@@ -125,8 +138,9 @@ def run(model: str = typer.Argument(...),
         repeat: int = typer.Option(5, "--repeat"),
         warmup: int = typer.Option(0, "--warmup"),
         timeout: float = typer.Option(600.0, "--timeout"),
-        output: str = typer.Option("", "--output"),
-        trace: str = typer.Option("", "--trace", help="write resource time-series JSON here"),
+        output: str = typer.Option(DEFAULT_RESULTS, "--output", help="results JSONL (default under .report/)"),
+        trace: bool = typer.Option(True, "--trace/--no-trace", help="write the resource time-series"),
+        trace_path: str = typer.Option("", "--trace-path", help="explicit trace file (default .report/traces/<case>.json)"),
         trace_interval: float = typer.Option(0.02, "--trace-interval"),
         models: Optional[str] = typer.Option(None, "--models", help="model alias map json"),
         model_root: Optional[str] = typer.Option(None, "--model-root"),
@@ -138,18 +152,22 @@ def run(model: str = typer.Argument(...),
         max_threads=max_threads, bbuf_size_kb=bbuf_size_kb,
         max_batch_bytes=max_batch_bytes,
     )
+    eff_trace = ""
+    if trace:
+        slug = _slug(resolved["alias"], mode, f"ws{world_size}", f"q{queue_size}", cache)
+        eff_trace = trace_path or f"{REPORT_DIR}/traces/{slug}.json"
     if world_size > 1:
         code = _launch_torchrun(
             resolved["path"], opts, world_size, cache, repeat, warmup, timeout,
             output, resolved["alias"], resolved["revision"], hardware_profile, "",
-            trace=trace)
+            trace=eff_trace)
         raise typer.Exit(code)
 
     config = RunConfig(
         model_path=resolved["path"], model_alias=resolved["alias"],
         model_revision=resolved["revision"], hardware_profile=hardware_profile,
         world_size=1, repeat=repeat, warmup=warmup, cache_policy=cache,
-        timeout_seconds=timeout, output=output, trace_path=trace,
+        timeout_seconds=timeout, output=output, trace_path=eff_trace,
         trace_sample_interval=trace_interval, options=opts,
     )
     raise typer.Exit(run_case(config))
@@ -162,7 +180,8 @@ def run(model: str = typer.Argument(...),
 def matrix(config_file: str = typer.Argument(..., help="host matrix json"),
            models: Optional[str] = typer.Option(None, "--models"),
            model_root: Optional[str] = typer.Option(None, "--model-root"),
-           output_dir: str = typer.Option("results", "--output-dir")):
+           output_dir: str = typer.Option(REPORT_DIR, "--output-dir"),
+           trace: bool = typer.Option(True, "--trace/--no-trace", help="write per-case time-series")):
     """Run every case listed in a host matrix config.
 
     Cartesian expansion is intentionally *not* done here: each case is listed
@@ -192,6 +211,10 @@ def matrix(config_file: str = typer.Argument(..., help="host matrix json"),
         world_size = merged.get("world_size", 1)
         case_id = merged.get("case_id", "")
         out = os.path.join(output_dir, f"{merged.get('model')}.jsonl")
+        eff_trace = ""
+        if trace:
+            slug = _slug(case_id or merged.get("model"), opts.mode, f"ws{world_size}")
+            eff_trace = os.path.join(output_dir, "traces", f"{slug}.json")
         typer.echo(f"--- case: {case_id or merged.get('model')} "
                    f"(mode={opts.mode} ws={world_size} q={opts.queue_size}) ---")
 
@@ -200,14 +223,15 @@ def matrix(config_file: str = typer.Argument(..., help="host matrix json"),
                 resolved["path"], opts, world_size, merged.get("cache", CACHE_COLD),
                 merged.get("repeat", 5), merged.get("warmup", 0),
                 merged.get("timeout", 600.0), out, resolved["alias"],
-                resolved["revision"], hardware_profile, case_id)
+                resolved["revision"], hardware_profile, case_id, trace=eff_trace)
         else:
             rc = RunConfig(
                 model_path=resolved["path"], model_alias=resolved["alias"],
                 model_revision=resolved["revision"], hardware_profile=hardware_profile,
                 case_id=case_id, world_size=1, repeat=merged.get("repeat", 5),
                 warmup=merged.get("warmup", 0), cache_policy=merged.get("cache", CACHE_COLD),
-                timeout_seconds=merged.get("timeout", 600.0), output=out, options=opts,
+                timeout_seconds=merged.get("timeout", 600.0), output=out,
+                trace_path=eff_trace, options=opts,
             )
             for k, v in opts.extra_env.items():
                 os.environ[k] = str(v)
@@ -278,6 +302,59 @@ def report(results: List[str] = typer.Argument(..., help="one or more result JSO
         typer.echo(json.dumps(report_mod.to_chart_data(rows), indent=2))
     else:
         typer.echo(report_mod.format_table(rows))
+
+
+# --- html -------------------------------------------------------------------
+
+
+def _expand_results(paths: List[str]) -> List[str]:
+    """Expand file/dir args to a list of .jsonl files."""
+    out: List[str] = []
+    for p in paths:
+        if os.path.isdir(p):
+            out += sorted(glob.glob(os.path.join(p, "*.jsonl")))
+        else:
+            out.append(p)
+    return out
+
+
+@app.command()
+def html(results: List[str] = typer.Argument(None, help="results JSONL file(s) or dir (default .report/)"),
+         traces: str = typer.Option(f"{REPORT_DIR}/traces", "--traces", help="trace dir or file"),
+         output: str = typer.Option(f"{REPORT_DIR}/index.html", "--output"),
+         title: str = typer.Option("fastsafetensors weight-load benchmark", "--title"),
+         subtitle: str = typer.Option("", "--subtitle")):
+    """Render a standalone HTML report (fixed design) from results + traces.
+
+    Reads the same JSONL the gate consumes plus any `--trace` time-series, and
+    writes one self-contained HTML file. Defaults read/write under .report/.
+    """
+    result_paths = _expand_results(results or [REPORT_DIR])
+    aggregates: List[dict] = []
+    for path in result_paths:
+        if os.path.isfile(path):
+            aggregates += report_mod.load_aggregates([path])
+    if not aggregates:
+        typer.echo(f"no aggregate records found in {result_paths}", err=True)
+        raise typer.Exit(2)
+
+    trace_docs: List[dict] = []
+    trace_files = (sorted(glob.glob(os.path.join(traces, "*.json")))
+                   if os.path.isdir(traces) else ([traces] if os.path.isfile(traces) else []))
+    for tf in trace_files:
+        try:
+            with open(tf, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            if doc.get("schema") == "trace-1":
+                trace_docs.append(doc)
+        except Exception:
+            continue
+
+    page = htmlreport_mod.render(aggregates, trace_docs, title=title, subtitle=subtitle)
+    os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)
+    with open(output, "w", encoding="utf-8") as fh:
+        fh.write(page)
+    typer.echo(f"wrote {output}  ({len(aggregates)} configs, {len(trace_docs)} traces)")
 
 
 if __name__ == "__main__":
