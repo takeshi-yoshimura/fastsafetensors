@@ -6,7 +6,7 @@ import os
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from . import cpp as fstcpp
 from .dlpack import from_cuda_buffer
@@ -35,6 +35,31 @@ def is_gpu_found():
     This allows code to work transparently across both platforms.
     """
     return fstcpp.is_cuda_found() or fstcpp.is_hip_found()
+
+
+def get_fs_type(path: str, mounts_file: str = "/proc/mounts") -> str:
+    """Best-effort filesystem type for *path* (longest mount-point prefix
+    match). Returns "" when it cannot be determined (non-Linux, unreadable
+    mounts table). Used to pick I/O strategies -- e.g. O_DIRECT is a win on
+    local block devices but loses kernel readahead on network filesystems.
+    """
+    try:
+        real = os.path.realpath(path)
+        best_mnt, best_type = "", ""
+        with open(mounts_file) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                # /proc/mounts octal-escapes spaces and tabs in mount points
+                mnt = parts[1].replace("\\040", " ").replace("\\011", "\t")
+                fstype = parts[2]
+                if real == mnt or real.startswith(mnt.rstrip("/") + "/"):
+                    if len(mnt) > len(best_mnt):
+                        best_mnt, best_type = mnt, fstype
+        return best_type
+    except OSError:
+        return ""
 
 
 def get_device_numa_node(device: Optional[int]) -> Optional[int]:
@@ -341,8 +366,24 @@ class SafeTensorsMetadata:
         copy_start_offset: int,
         dtype: DType = DType.AUTO,
     ) -> Dict[str, TensorBase]:
+        """Instantiate every tensor in this shard from the device buffer."""
+        return self._get_tensors(gbuf, device, copy_start_offset, dtype)
+
+    def _get_tensors(
+        self,
+        gbuf: fstcpp.gds_device_buffer,
+        device: Device,
+        copy_start_offset: int,
+        dtype: DType = DType.AUTO,
+        names: Optional[Set[str]] = None,
+    ) -> Dict[str, TensorBase]:
+        # ``names`` restricts instantiation to that subset of tensors. Required
+        # when ``gbuf`` is a compacted chunk buffer (holding only some tensors'
+        # bytes): other tensors' computed offsets would fall outside the buffer.
         ret = {}
         for tensor_name, t in self.tensors.items():
+            if names is not None and tensor_name not in names:
+                continue
             dst_dev_ptr = (
                 gbuf.get_base_address()
                 + self.header_length

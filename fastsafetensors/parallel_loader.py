@@ -4,7 +4,7 @@ import os
 import queue
 import threading
 import time
-from typing import Any, Callable, Generator, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Generator, List, Optional, Set, Tuple, Union
 
 try:
     from tqdm.auto import tqdm
@@ -18,7 +18,8 @@ except ImportError:
 
 
 from . import cpp as fstcpp
-from .common import SingleGroup
+from ._planner import plan_chunks
+from .common import SafeTensorsMetadata, SingleGroup
 from .frameworks import FrameworkOpBase
 from .loader import BaseSafeTensorsFileLoader, SafeTensorsFileLoader
 
@@ -139,6 +140,7 @@ class PipelineParallel:
         queue_size: int = 0,
         use_tqdm_on_load: bool = True,
         tensor_filter: Optional[Callable[[str], bool]] = None,
+        max_batch_bytes: Optional[int] = None,
         **kwargs,
     ):
 
@@ -168,8 +170,12 @@ class PipelineParallel:
         self.max_concurrent_producers = max_concurrent_producers
         self.queue_size = queue_size
         self.use_tqdm_on_load = use_tqdm_on_load
+        # When set, each shard is loaded in sub-file chunks (span <= this many
+        # bytes) so peak device buffer per rank is bounded regardless of shard
+        # size. See _planner.plan_chunks / CopierInterface.set_chunk.
+        self.max_batch_bytes = max_batch_bytes
 
-        # Batch files
+        # Batch files (or, with max_batch_bytes, sub-file chunk-batches)
         self.weight_files_batches = self._create_batches(pg)
 
         # Producer-consumer communication
@@ -198,7 +204,7 @@ class PipelineParallel:
 
         fstcpp.set_gil_release(True)
 
-    def _create_batches(self, pg) -> List[List[str]]:
+    def _create_batches(self, pg) -> List[List[Any]]:
         """Create file batches based on distributed settings.
 
         In distributed mode, files are grouped by the process group size so that
@@ -212,10 +218,45 @@ class PipelineParallel:
                             files for all processes in the group
         """
         batch_size = pg.size()
-        return [
+        file_batches = [
             self.hf_weights_files[i : i + batch_size]
             for i in range(0, len(self.hf_weights_files), batch_size)
         ]
+        if self.max_batch_bytes is None:
+            return file_batches
+        # Sub-file chunking: expand each file-batch (one file per rank) into
+        # aligned chunk-batches. Chunk-batch j holds rank r's j-th chunk (or
+        # None once that rank's file runs out), so every rank issues the same
+        # broadcast sequence in lockstep. Header reads are deterministic, so all
+        # ranks build identical batches. Each shard stays owned by one rank and
+        # is loaded in chunks over successive batches -> peak buffer bounded by
+        # max_batch_bytes per rank.
+        keep = self.loader._tensor_filter
+        fw = self.loader.framework
+        chunk_batches: List[List[Any]] = []
+        for group in file_batches:
+            planned = [
+                (
+                    f,
+                    plan_chunks(
+                        SafeTensorsMetadata.from_file(f, fw),
+                        self.max_batch_bytes,
+                        keep_tensor=keep,
+                    ),
+                )
+                for f in group
+            ]
+            maxn = max((len(chunks) for _, chunks in planned), default=0)
+            for j in range(maxn):
+                spec: List[Any] = []
+                for f, chunks in planned:
+                    if j < len(chunks):
+                        names, ranges = chunks[j]
+                        spec.append((f, names, ranges))
+                    else:
+                        spec.append(None)
+                chunk_batches.append(spec)
+        return chunk_batches
 
     def _log_message(self, message: str, is_error: bool = False):
         """Unified logging method for conditional print statements.
@@ -229,7 +270,65 @@ class PipelineParallel:
     def _log_error(self, message: str):
         self._log_message(message, is_error=True)
 
-    def _load_single_batch(self, batch_id: int, file_list: List[str]):
+    def _wait_consumer_processed(self) -> bool:
+        """Wait for the consumer to finish the previous batch, cancellable.
+
+        Returns False once cleanup has begun (stop_event set), so the producer
+        abandons the batch instead of blocking forever when the consumer stops
+        iterating mid-batch. The timeout only bounds how long a missed wakeup
+        could linger; cleanup also sets consumer_processed for an instant wakeup.
+        """
+        assert self.consumer_processed is not None
+        while not self.stop_event.is_set():
+            if self.consumer_processed.wait(timeout=0.1):
+                return not self.stop_event.is_set()
+        return False
+
+    def _put_cancellable(self, item: Union[FileBatch, Exception, None]) -> bool:
+        """Queue put that gives up once cleanup has begun.
+
+        A plain put() can block forever when the consumer stopped iterating
+        mid-batch (queue full, nobody left to get). Returns False if the item
+        was not delivered.
+        """
+        while not self.stop_event.is_set():
+            try:
+                self.batch_queue.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _drain_queue(self):
+        """Discard queued items, closing any file buffers the consumer never took."""
+        while True:
+            try:
+                item = self.batch_queue.get_nowait()
+            except queue.Empty:
+                return
+            if isinstance(item, FileBatch):
+                item.fb.close()
+
+    def _spec_to_maps(self, spec: List[Any]):
+        """Turn a batch spec into (rank_file_map, chunk_plan).
+
+        Without max_batch_bytes the spec is a list of files (one per rank). With
+        it, the spec is a chunk-batch: per rank, either (file, names, ranges) or
+        None (that rank has no chunk this batch).
+        """
+        if self.max_batch_bytes is None:
+            return {i: [f] for i, f in enumerate(spec)}, None
+        rank_file_map: Dict[int, List[str]] = {}
+        chunk_plan: Dict[str, Tuple[Set[str], List[Tuple[int, int]]]] = {}
+        for r, entry in enumerate(spec):
+            if entry is None:
+                continue
+            f, names, ranges = entry
+            rank_file_map[r] = [f]
+            chunk_plan[f] = (names, ranges)
+        return rank_file_map, chunk_plan
+
+    def _load_single_batch(self, batch_id: int, file_list: List[Any]):
         """Load a single batch into device memory.
 
         This method handles the complete process of loading a batch of files:
@@ -253,19 +352,18 @@ class PipelineParallel:
             return
 
         try:
-            # Prepare file mapping
-            rank_file_map = {i: [f] for i, f in enumerate(file_list)}
+            rank_file_map, chunk_plan = self._spec_to_maps(file_list)
 
             with TimingContext("add_filenames", self._log_message, batch_id) as timer:
                 self.loader.add_filenames(rank_file_map)
+                if chunk_plan is not None:
+                    self.loader._set_chunk_plan(chunk_plan)
             add_filenames_time = timer.elapsed_ms
 
             # For unbuffered behavior, wait for consumer to process previous item
             if self.queue_size <= 0 and self.consumer_processed is not None:
-                if not self.consumer_processed.wait():
-                    raise TimeoutError(
-                        "can not waiting for consumer to process previous batch"
-                    )
+                if not self._wait_consumer_processed():
+                    return  # cleanup began; skip the batch
                 # Clear the event after wait to ensure next wait will block
                 self.consumer_processed.clear()
 
@@ -285,15 +383,17 @@ class PipelineParallel:
             batch.load_time = add_filenames_time + copy_time  # Total load time
 
             # Put into queue for consumer processing
-            if not self.stop_event.is_set():
-                self.batch_queue.put(batch)
+            if self._put_cancellable(batch):
                 with TimingContext("loader.reset", self._log_message, batch_id):
                     self.loader.reset()
+            else:
+                # Consumer is gone; release the batch's device memory.
+                fb.close()
 
         except Exception as e:
             self.error_info = f"Producer batch {batch_id} failed: {e}"
             self.error_event.set()
-            self.batch_queue.put(e)  # Notify consumer of error
+            self._put_cancellable(e)  # Notify consumer of error
 
     def _producer_worker(self):
         """Producer worker thread: responsible for copy_files_to_device operations.
@@ -316,10 +416,10 @@ class PipelineParallel:
             if not self.error_event.is_set():
                 self.error_info = f"Producer future failed: {e}"
                 self.error_event.set()
-                self.batch_queue.put(e)
+                self._put_cancellable(e)
 
         # Signal end of production
-        self.batch_queue.put(None)
+        self._put_cancellable(None)
 
     def _consume_single_batch(self):
         with TimingContext("wait_queue", self._log_message) as timer:
@@ -421,9 +521,20 @@ class PipelineParallel:
         try:
             yield from self._consumer_worker()
         finally:
-            # Cleanup work
+            # Cleanup: the consumer may stop mid-iteration (generator closed,
+            # exception), leaving the producer parked on consumer_processed or
+            # a full queue. Wake both so it observes stop_event and exits.
             self.stop_event.set()
+            if self.consumer_processed is not None:
+                self.consumer_processed.set()
+            self._drain_queue()
             producer_thread.join(timeout=5)
+            if producer_thread.is_alive():
+                self._log_error(
+                    "producer thread still running after close (it exits "
+                    "once any in-flight copy completes)"
+                )
+            self._drain_queue()
 
     def close(self):
         self.loader.close()
@@ -492,6 +603,7 @@ class ParallelLoader(PipelineParallel):
         framework="pytorch",
         tensor_filter: Optional[Callable[[str], bool]] = None,
         all_local: bool = False,
+        max_batch_bytes: Optional[int] = None,
         **kwargs,
     ):
         """Initialize PipelineParallelLoader with a pre-configured SafeTensorsFileLoader.
@@ -535,5 +647,6 @@ class ParallelLoader(PipelineParallel):
             queue_size,
             use_tqdm_on_load,
             tensor_filter=tensor_filter,
+            max_batch_bytes=max_batch_bytes,
             **kwargs,
         )

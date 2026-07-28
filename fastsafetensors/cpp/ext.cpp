@@ -108,6 +108,10 @@ static inline int munmap(void* addr, size_t /*length*/) {
 #include <chrono>
 #include <cstdlib>
 #include <algorithm>
+#include <atomic>
+#include <thread>
+#include <vector>
+#include <mutex>
 
 #include "gpu_compat.h"
 #include "ext.hpp"
@@ -972,6 +976,132 @@ cpp_metrics_t get_cpp_metrics() {
 
 // Bindings
 
+// Multithreaded O_DIRECT range reader for the unified copier: reads only the
+// [starts[i], ends[i]) file runs into a device buffer, placing file byte F at
+// gbuf[F - header_len]. Threads split the concatenated owned-byte space so one
+// large run + many small runs still spread evenly; thread boundaries mid-run
+// align the O_DIRECT offset down and overlapping reads write identical bytes
+// (idempotent). Bypasses the page cache (O_DIRECT) and drives NVMe queue depth,
+// which buffered mmap+pin cannot. Uses the dlopen'd cuda_fns table (no cudart
+// link) -- pinned bounce + sync cudaMemcpy. header_len is the buffer-base offset,
+// so a compacted chunk buffer passes its span start instead of the real header.
+// Reusable pinned 16MB bounce buffers, shared across dma_load_runs calls (and
+// concurrent producers). Chunked loading makes many small calls; recycling the
+// pinned buffers avoids a cudaHostAlloc/cudaFreeHost per chunk per thread.
+// Allocated portable (cudaHostAllocPortable / hipHostMallocPortable, both 0x1)
+// so a buffer first pinned under one device's context stays valid pinned
+// memory when a later call targets a different device.
+static std::mutex g_pin_mtx;
+static std::vector<void *> g_pin_pool;
+static const size_t PIN_CHUNK = 16UL << 20;
+static const unsigned int PIN_FLAG_PORTABLE = 0x1;
+
+static void *pin_acquire() {
+    {
+        std::lock_guard<std::mutex> lk(g_pin_mtx);
+        if (!g_pin_pool.empty()) {
+            void *p = g_pin_pool.back();
+            g_pin_pool.pop_back();
+            return p;
+        }
+    }
+    void *p = nullptr;
+    if (cuda_fns.cudaHostAlloc(&p, PIN_CHUNK, PIN_FLAG_PORTABLE) != cudaSuccess)
+        return nullptr;
+    return p;
+}
+
+static void pin_release(void *p) {
+    if (!p) return;
+    std::lock_guard<std::mutex> lk(g_pin_mtx);
+    g_pin_pool.push_back(p);
+}
+
+static int dma_load_runs(uintptr_t gbuf_dev, const std::string &path,
+                         size_t header_len,
+                         const std::vector<size_t> &starts,
+                         const std::vector<size_t> &ends, int nthreads,
+                         int device_id) {
+    if (!cuda_fns.cudaHostAlloc || !cuda_fns.cudaMemcpy || !cuda_fns.cudaFreeHost
+        || !cuda_fns.cudaDeviceSynchronize) {
+        return -10;
+    }
+    const size_t n_runs = starts.size();
+    if (n_runs == 0 || ends.size() != n_runs) return 0;
+    size_t total = 0;
+    for (size_t i = 0; i < n_runs; i++) total += ends[i] - starts[i];
+    if (total == 0) return 0;
+    if (nthreads < 1) nthreads = 4;
+    if (nthreads > 32) nthreads = 32;
+
+    char *gbuf = reinterpret_cast<char *>(gbuf_dev);
+    const size_t CHUNK = 16UL << 20;
+    const size_t ALN = 4096UL;
+    std::atomic<int> rc{0};
+    std::vector<std::thread> threads;
+
+    for (int ti = 0; ti < nthreads; ti++) {
+        size_t gbs = (size_t)((double)ti * total / nthreads);
+        size_t gbe = (ti == nthreads - 1) ? total
+                                          : (size_t)((double)(ti + 1) * total / nthreads);
+        if (gbe <= gbs) continue;
+        threads.emplace_back([&, gbs, gbe]() {
+            // The current CUDA device is thread-local and defaults to 0 in a
+            // fresh thread; select the loader's target before any CUDA call so
+            // contexts and copies land on the right device (device_id < 0 =
+            // caller doesn't know, e.g. cpu device: leave the default).
+            if (device_id >= 0) cuda_fns.cudaSetDevice(device_id);
+            void *pinned = pin_acquire();
+            if (!pinned) {
+                rc = -1;
+                return;
+            }
+            int fd = open(path.c_str(), O_RDONLY | O_DIRECT);
+            if (fd < 0) {
+                rc = -2;
+                pin_release(pinned);
+                return;
+            }
+            size_t cum = 0;
+            for (size_t r = 0; r < n_runs && rc.load() == 0; r++) {
+                size_t rs = starts[r], re = ends[r], rlen = re - rs;
+                size_t b0 = cum, b1 = cum + rlen;  // this run in owned-byte space
+                cum = b1;
+                size_t ov0 = b0 > gbs ? b0 : gbs;  // overlap with my span
+                size_t ov1 = b1 < gbe ? b1 : gbe;
+                if (ov0 >= ov1) continue;
+                size_t fstart = rs + (ov0 - b0);   // file coords of my portion
+                size_t fend = rs + (ov1 - b0);
+                size_t astart = fstart & ~(ALN - 1);  // align O_DIRECT offset down
+                for (size_t fo = astart; fo < fend; fo += CHUNK) {
+                    size_t want = fend - fo;
+                    size_t reqlen = (want >= CHUNK) ? CHUNK
+                                                    : ((want + ALN - 1) & ~(ALN - 1));
+                    ssize_t got = pread(fd, pinned, reqlen, fo);
+                    if (got <= 0) { rc = -3; break; }
+                    size_t fo_end = fo + (size_t)got;
+                    size_t cs = fo > fstart ? fo : fstart;  // copy only [fstart,fend)
+                    size_t ce = fo_end < fend ? fo_end : fend;
+                    if (cs < ce) {
+                        cudaError_t e = cuda_fns.cudaMemcpy(
+                            gbuf + (cs - header_len), (char *)pinned + (cs - fo),
+                            ce - cs, cudaMemcpyHostToDevice);
+                        if (e != cudaSuccess) { rc = -4; break; }
+                    }
+                    if (fo_end >= fend) break;
+                }
+            }
+            // Synchronize on this thread (its current device is the target);
+            // the calling thread may have a different device current.
+            cuda_fns.cudaDeviceSynchronize();
+            close(fd);
+            pin_release(pinned);
+        });
+    }
+    for (auto &t : threads) t.join();
+    return rc.load();
+}
+
 // Async host-to-device memcpy for unified memory copier
 static int memcpy_h2d_async(uintptr_t dst, uintptr_t src, size_t size) {
     if (!cuda_fns.cudaMemcpyAsync) {
@@ -1013,6 +1143,19 @@ PYBIND11_MODULE(__MOD_NAME__, m)
     m.def("load_library_functions", &load_library_functions,
           pybind11::arg("cudart_lib_name") = "");
     m.def("memcpy_h2d_async", &memcpy_h2d_async);
+    m.def(
+        "dma_load_runs",
+        [](uintptr_t gbuf_dev, const std::string &path, size_t header_len,
+           const std::vector<size_t> &starts, const std::vector<size_t> &ends,
+           int nthreads, int device_id) {
+            pybind11::gil_scoped_release release;  // blocking O_DIRECT + DMA
+            return dma_load_runs(gbuf_dev, path, header_len, starts, ends,
+                                 nthreads, device_id);
+        },
+        pybind11::arg("gbuf_dev"), pybind11::arg("path"),
+        pybind11::arg("header_len"), pybind11::arg("starts"),
+        pybind11::arg("ends"), pybind11::arg("nthreads") = 8,
+        pybind11::arg("device_id") = -1);
     m.def("get_cpp_metrics", &get_cpp_metrics);
     m.def("set_gil_release", &set_gil_release);
     m.def("get_gil_release", &get_gil_release);
