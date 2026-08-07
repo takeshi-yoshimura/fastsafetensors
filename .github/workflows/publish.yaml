@@ -26,6 +26,12 @@ jobs:
             runner: windows-latest
             build: win_amd64
             cibw_arch: AMD64
+            redist_arch: x64
+          - arch: win_arm64
+            runner: windows-11-arm
+            build: win_arm64
+            cibw_arch: ARM64
+            redist_arch: arm64
 
     steps:
     - name: Checkout code
@@ -48,13 +54,15 @@ jobs:
         $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
         $vs = & $vswhere -latest -products * -property installationPath
         if (-not $vs) { throw "Visual Studio installation not found" }
-        $redist = Get-ChildItem "$vs\VC\Redist\MSVC" -Recurse -Filter vc_redist.x64.exe |
+        $redistArch = "${{ matrix.platform.redist_arch }}"
+        $redistName = "vc_redist.$redistArch.exe"
+        $redist = Get-ChildItem "$vs\VC\Redist\MSVC" -Recurse -Filter $redistName |
           Sort-Object { $_.VersionInfo.FileVersionRaw } | Select-Object -Last 1
-        if (-not $redist) { throw "vc_redist.x64.exe not found under $vs" }
+        if (-not $redist) { throw "$redistName not found under $vs" }
         Write-Host "Installing $($redist.FullName) ($($redist.VersionInfo.FileVersion))"
         $p = Start-Process -FilePath $redist.FullName -ArgumentList '/install','/quiet','/norestart' -Wait -PassThru
         # 1638: same or newer version already installed; 3010: success, reboot required
-        if ($p.ExitCode -notin 0, 1638, 3010) { throw "vc_redist.x64.exe exited with $($p.ExitCode)" }
+        if ($p.ExitCode -notin 0, 1638, 3010) { throw "$redistName exited with $($p.ExitCode)" }
 
     - name: Install cibuildwheel
       run: python -m pip install cibuildwheel setuptools pybind11
@@ -66,9 +74,9 @@ jobs:
         CIBW_SKIP: "*-musllinux_* *-win32 *-manylinux_i686"
         CIBW_TEST_COMMAND: "python {project}/tests/smoke_import_cpp.py"
         CIBW_ARCHS: "${{ matrix.platform.cibw_arch }}"
-        # Bundle MSVC runtime satellite DLLs into the wheel; the VS2026 runner
-        # image builds against a toolchain newer than what end-user machines
-        # (and the test env) may have installed.
+        # Bundle MSVC runtime satellite DLLs into the wheel; Windows runner
+        # images can build against a toolchain newer than what end-user
+        # machines (and the test env) may have installed.
         CIBW_BEFORE_BUILD_WINDOWS: "pip install delvewheel"
         # --add-path makes delvewheel take msvcp140.dll from System32 (kept
         # current by the redist step above) instead of a stale copy that some
