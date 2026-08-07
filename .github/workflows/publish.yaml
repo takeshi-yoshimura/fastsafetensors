@@ -18,23 +18,19 @@ jobs:
             runner: ubuntu-latest
             build: manylinux_x86_64
             cibw_arch: x86_64
-            setup_arch: x64
           - arch: aarch64
             runner: ubuntu-24.04-arm
             build: manylinux_aarch64
             cibw_arch: aarch64
-            setup_arch: arm64
           - arch: win_amd64
             runner: windows-latest
             build: win_amd64
             cibw_arch: AMD64
-            setup_arch: x64
             redist_arch: x64
           - arch: win_arm64
             runner: windows-11-arm
             build: win_arm64
             cibw_arch: ARM64
-            setup_arch: arm64
             redist_arch: arm64
 
     steps:
@@ -45,7 +41,6 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: "3.11"
-        architecture: ${{ matrix.platform.setup_arch }}
 
     # The wheel is built with the image's newest MSVC toolset, but the
     # image's installed VC redistributable can lag behind it (14.40 vs 14.51
