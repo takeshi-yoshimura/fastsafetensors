@@ -74,3 +74,8 @@ If the DirectStorage DLLs are not installed, the Windows loader falls back to
 the bounce-buffer (`nogds`) path. Set `FASTSAFETENSORS_DSTORAGE_DLL_DIR` to an
 absolute directory containing `dstoragecore.dll` and `dstorage.dll` to enable
 DirectStorage; an invalid explicit directory remains an error.
+
+The fallback resolves a framework-bundled CUDA runtime first (for example,
+PyTorch's `torch\lib` directory), then checks system CUDA Toolkit locations.
+`FASTSAFETENSORS_CUDART_LIB` can specify an absolute runtime DLL explicitly and
+takes precedence over automatic discovery.

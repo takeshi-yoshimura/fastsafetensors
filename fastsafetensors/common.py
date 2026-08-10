@@ -103,7 +103,7 @@ def resolve_runtime_lib_name(framework=None) -> str:
     back to auto-detection.
     """
     if sys.platform == "win32":
-        return _resolve_windows_cudart_lib_name()
+        return _resolve_windows_cudart_lib_name(framework)
     if framework is None:
         return ""
     try:
@@ -120,7 +120,7 @@ def resolve_runtime_lib_name(framework=None) -> str:
     return ""
 
 
-def _resolve_windows_cudart_lib_name() -> str:
+def _resolve_windows_cudart_lib_name(framework=None) -> str:
     """Resolve the absolute cudart DLL path on Windows, "" for the default."""
     # Allow explicit override via environment variable
     override = os.environ.get("FASTSAFETENSORS_CUDART_LIB", "").strip()
@@ -139,7 +139,7 @@ def _resolve_windows_cudart_lib_name() -> str:
         d = os.path.abspath(expanded)
         if not os.path.isdir(d):
             return ""
-        matches = glob.glob(os.path.join(d, "cudart64_*.dll"))
+        matches = glob.glob(os.path.join(d, "cudart64*.dll"))
         if matches:
             matches.sort(reverse=True)
             return os.path.abspath(matches[0])
@@ -170,6 +170,18 @@ def _resolve_windows_cudart_lib_name() -> str:
             return ""
         except Exception:
             return ""
+
+    # Framework wheels such as PyTorch can bundle cudart without installing a
+    # system CUDA Toolkit.
+    if framework is not None:
+        try:
+            runtime_dirs = framework.get_runtime_lib_dirs()
+        except (AttributeError, OSError):
+            runtime_dirs = []
+        for runtime_dir in runtime_dirs:
+            result = _find_cudart_in_dir(runtime_dir)
+            if result:
+                return result
 
     # Try to detect from CUDA_HOME / CUDA_PATH
     cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")

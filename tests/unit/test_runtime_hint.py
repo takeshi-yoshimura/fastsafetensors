@@ -3,6 +3,8 @@
 """Unit tests for the framework-hinted GPU runtime selection."""
 
 import sys
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -10,13 +12,17 @@ from fastsafetensors import common
 
 
 class _FakeFramework:
-    def __init__(self, cuda_ver):
+    def __init__(self, cuda_ver, runtime_lib_dirs=None):
         self._ver = cuda_ver
+        self._runtime_lib_dirs = runtime_lib_dirs or []
 
     def get_cuda_ver(self):
         if isinstance(self._ver, Exception):
             raise self._ver
         return self._ver
+
+    def get_runtime_lib_dirs(self):
+        return self._runtime_lib_dirs
 
 
 @pytest.fixture(autouse=True)
@@ -53,6 +59,42 @@ def test_get_cuda_ver_raises_uses_autodetect():
 def test_windows_is_noop(monkeypatch):
     monkeypatch.setattr(sys, "platform", "win32")
     assert common.resolve_runtime_lib_name(_FakeFramework("hip-7.2.0")) == ""
+
+
+def test_windows_uses_framework_bundled_cudart(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.delenv("FASTSAFETENSORS_CUDART_LIB", raising=False)
+    monkeypatch.delenv("CUDA_HOME", raising=False)
+    monkeypatch.delenv("CUDA_PATH", raising=False)
+    with tempfile.TemporaryDirectory() as tmp:
+        runtime_dir = Path(tmp) / "torch" / "lib"
+        runtime_dir.mkdir(parents=True)
+        cudart = runtime_dir / "cudart64_12.dll"
+        cudart.touch()
+
+        result = common.resolve_runtime_lib_name(
+            _FakeFramework("cuda-12.8", [str(runtime_dir)])
+        )
+
+        assert result == str(cudart.absolute())
+
+
+def test_windows_explicit_cudart_takes_precedence(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    with tempfile.TemporaryDirectory() as tmp:
+        override = Path(tmp) / "configured" / "cudart64_12.dll"
+        override.parent.mkdir()
+        override.touch()
+        bundled_dir = Path(tmp) / "torch" / "lib"
+        bundled_dir.mkdir(parents=True)
+        (bundled_dir / "cudart64_13.dll").touch()
+        monkeypatch.setenv("FASTSAFETENSORS_CUDART_LIB", str(override))
+
+        result = common.resolve_runtime_lib_name(
+            _FakeFramework("cuda-12.8", [str(bundled_dir)])
+        )
+
+        assert result == str(override.absolute())
 
 
 def test_load_library_func_hint_with_no_gpu_raises(monkeypatch):

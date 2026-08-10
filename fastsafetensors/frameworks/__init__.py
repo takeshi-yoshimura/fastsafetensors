@@ -160,6 +160,10 @@ class FrameworkOpBase(ABC, Generic[T, K]):
     def get_cuda_ver(self) -> str:
         pass
 
+    def get_runtime_lib_dirs(self) -> List[str]:
+        """Return trusted directories containing framework-bundled GPU runtimes."""
+        return []
+
     @abstractmethod
     def get_device_ptr_align(self) -> int:
         pass
