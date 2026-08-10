@@ -69,3 +69,8 @@ The key steps are:
 5. Synchronize using a D3D12 fence imported as a cudaExternalSemaphore
 
 All DirectStorage, D3D12, and DXGI libraries are loaded at runtime via LoadLibrary/GetProcAddress — no link-time SDK dependency on DirectStorage is required.
+
+If the DirectStorage DLLs are not installed, the Windows loader falls back to
+the bounce-buffer (`nogds`) path. Set `FASTSAFETENSORS_DSTORAGE_DLL_DIR` to an
+absolute directory containing `dstoragecore.dll` and `dstorage.dll` to enable
+DirectStorage; an invalid explicit directory remains an error.
