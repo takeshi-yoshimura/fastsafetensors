@@ -239,6 +239,19 @@ def _make_loader(framework):
     return SafeTensorsFileLoader(None, "cpu", nogds=True, framework="pytorch")
 
 
+def _tight_budget(path, framework):
+    """The smallest budget that still admits two copies of *path* under
+    broadcast: resident for both shards plus one in-flight chunk per unit of
+    pipeline depth. Anything larger stops forcing sub-file chunking."""
+    from fastsafetensors import SafeTensorsMetadata
+    from fastsafetensors._planner import collect_file_stats, pipeline_depth
+
+    meta = SafeTensorsMetadata.from_file(path, framework)
+    (st,) = collect_file_stats([(path, meta)])
+    # broadcast adds one depth unit for the in-flight receive tensor
+    return 2 * st.kept_bytes + (pipeline_depth(0) + 1) * st.largest_tensor
+
+
 def test_broadcast_explicit_budget_allowed(input_files, framework, tmp_path):
     if framework.get_name() != "pytorch":
         pytest.skip("pytorch-only")
@@ -261,7 +274,10 @@ def test_broadcast_explicit_budget_allowed(input_files, framework, tmp_path):
     assert all(len(spec) == 2 for spec in pp.weight_files_batches)
 
 
-def test_broadcast_auto_budget_rejected(input_files, framework, tmp_path):
+def test_broadcast_budget_chunks_in_lockstep(input_files, framework, tmp_path):
+    """Under broadcast, a budget tight enough to split shards must still give
+    every rank the same number of chunk-batches, each full width -- a ragged
+    sequence would leave some rank broadcasting while another has finished."""
     if framework.get_name() != "pytorch":
         pytest.skip("pytorch-only")
     import shutil
@@ -270,12 +286,15 @@ def test_broadcast_auto_budget_rejected(input_files, framework, tmp_path):
 
     f2 = str(tmp_path / "copy2.safetensors")
     shutil.copy(input_files[0], f2)
-    with pytest.raises(NotImplementedError, match="all-reduce"):
-        PipelineParallel(
-            _FakePG(),
-            _make_loader(framework),
-            [input_files[0], f2],
-            queue_size=0,
-            use_tqdm_on_load=False,
-            device_memory_budget="auto",
-        )
+    pp = PipelineParallel(
+        _FakePG(),
+        _make_loader(framework),
+        [input_files[0], f2],
+        queue_size=0,
+        use_tqdm_on_load=False,
+        device_memory_budget=_tight_budget(input_files[0], framework),
+    )
+    specs = pp.weight_files_batches
+    # More batches than files => the budget actually forced sub-file chunking.
+    assert len(specs) > 1, specs
+    assert all(len(spec) == 2 for spec in specs), specs

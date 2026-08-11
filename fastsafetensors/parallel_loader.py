@@ -142,7 +142,7 @@ class PipelineParallel:
         use_tqdm_on_load: bool = True,
         tensor_filter: Optional[Callable[[str], bool]] = None,
         max_batch_bytes: Optional[int] = None,
-        device_memory_budget: Optional[Union[int, str]] = None,
+        device_memory_budget: Optional[int] = None,
         accumulate_resident: bool = True,
         **kwargs,
     ):
@@ -177,11 +177,13 @@ class PipelineParallel:
         # bytes) so peak device buffer per rank is bounded regardless of shard
         # size. See _planner.plan_chunks / CopierInterface.set_chunk.
         self.max_batch_bytes = max_batch_bytes
-        # When set, bound the load's TOTAL device footprint (resident tensors
-        # + transient buffers) via a static fit plan: whole-file loads while
-        # headroom is ample, per-file chunk budgets declining as the device
-        # fills. int = bytes; "auto" = free memory minus a reserve, queried
-        # once at plan time. See fastsafetensors._planner.
+        # When set (bytes), bound the load's TOTAL device footprint (resident
+        # tensors + transient buffers) via a static fit plan: whole-file loads
+        # while headroom is ample, per-file chunk budgets declining as the
+        # device fills. The caller picks the number -- it knows what else lives
+        # on the device and, under broadcast loading, must pass the same value
+        # on every rank (e.g. all-reduce(MIN) of each rank's free memory) so
+        # the plan stays identical across ranks. See fastsafetensors._planner.
         self.device_memory_budget = device_memory_budget
         # True: the consumer keeps every yielded tensor (resident grows by
         # cumulative kept bytes). False: tensors are copied into preallocated
@@ -253,49 +255,31 @@ class PipelineParallel:
                 collect_file_stats,
                 pipeline_depth,
                 plan_file_budgets,
-                resolve_auto_budget,
             )
 
-            if isinstance(self.device_memory_budget, str):
-                if self.device_memory_budget != "auto":
-                    raise ValueError(
-                        f"device_memory_budget must be an int or 'auto', got "
-                        f"{self.device_memory_budget!r}"
-                    )
-                if batch_size > 1:
-                    # Per-rank free-memory readings diverge, which would give
-                    # ranks different plans and deadlock the lockstep broadcast
-                    # sequence. The caller owns the process group: min-reduce
-                    # free memory across ranks and pass the explicit result.
-                    raise NotImplementedError(
-                        'device_memory_budget="auto" requires a single-process '
-                        "loader group (all_local=True or pg=None); with "
-                        "broadcast loading, all-reduce(MIN) the free memory "
-                        "yourself and pass an explicit integer budget"
-                    )
-                budget = resolve_auto_budget(fw.get_mem_free(self.loader.device))
-            else:
-                budget = self.device_memory_budget
             metas = [
                 (f, SafeTensorsMetadata.from_file(f, fw)) for f in self.hf_weights_files
             ]
             # Broadcast mode adds one in-flight receive tensor (<= one chunk
-            # budget) on top of the live gbufs; an explicit identical budget on
-            # every rank keeps the plan deterministic across ranks.
+            # budget) on top of the live gbufs; the caller passing the same
+            # budget on every rank keeps the plan deterministic across ranks.
+            # batch_size also sets the group width: those files load together,
+            # one per rank, and every rank keeps all of them.
             depth = pipeline_depth(self.queue_size) + (1 if batch_size > 1 else 0)
-            # The mmap+pin fallback pins each chunk's pages alongside the
-            # device buffer; on unified memory both draw from one pool, so the
-            # planner must charge those chunks at 2x span (measured on GB10:
-            # the O_DIRECT path stays ~1x + fixed pool).
-            from .copier.unified import chunk_transient_multiplier
-
+            # How much transient device memory a live chunk costs is the
+            # copier's own business (e.g. the unified copier's mmap+pin
+            # fallback pins the chunk's pages alongside the device buffer,
+            # costing 2x span on a shared physical pool), so ask it.
+            copier = self.loader.copier_class
+            multiplier = copier.chunk_transient_multiplier([f for f, _ in metas])
             budgets = plan_file_budgets(
                 collect_file_stats(metas, keep),
-                budget,
+                self.device_memory_budget,
                 depth,
                 max_batch_bytes=self.max_batch_bytes,
                 accumulate_resident=self.accumulate_resident,
-                transient_multiplier=chunk_transient_multiplier([f for f, _ in metas]),
+                transient_multiplier=multiplier,
+                group_size=batch_size,
             )
             per_file_budget = {f: b for (f, _), b in zip(metas, budgets)}
             meta_by_path = dict(metas)
@@ -680,7 +664,7 @@ class ParallelLoader(PipelineParallel):
         tensor_filter: Optional[Callable[[str], bool]] = None,
         all_local: bool = False,
         max_batch_bytes: Optional[int] = None,
-        device_memory_budget: Optional[Union[int, str]] = None,
+        device_memory_budget: Optional[int] = None,
         accumulate_resident: bool = True,
         **kwargs,
     ):

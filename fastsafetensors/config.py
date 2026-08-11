@@ -3,7 +3,7 @@
 import json
 import os
 from dataclasses import dataclass, field, fields
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional
 
 from .common import init_logger
 
@@ -38,12 +38,12 @@ class LoaderConfig:
     # Must be >= the largest single tensor. See _planner.plan_chunks.
     max_batch_bytes: Optional[int] = None
 
-    # Bound the load's total device footprint (resident tensors + transient
-    # buffers) per rank via a static fit plan: whole-file loads while headroom
-    # is ample, chunking only where the fit requires it. int = bytes; "auto" =
-    # free device memory minus a reserve, queried once at plan time. Requires
-    # a single-process loader group. See fastsafetensors._planner.
-    device_memory_budget: Optional[Union[int, str]] = None
+    # Bound the load's total device footprint in bytes (resident tensors +
+    # transient buffers) per rank via a static fit plan: whole-file loads while
+    # headroom is ample, chunking only where the fit requires it. The caller
+    # picks the number; under broadcast loading it must be identical on every
+    # rank. See fastsafetensors._planner.
+    device_memory_budget: Optional[int] = None
 
     _extensions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 

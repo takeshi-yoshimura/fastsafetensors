@@ -22,22 +22,37 @@ decline only as the device fills, so chunking cost is paid only where the
 fit actually requires it. The plan is precomputed and deterministic: same
 files, same filter, same budget -> same plan. There is no runtime feedback.
 
-Why per-file budgets are safe (the bound): while any chunk of file ``i`` is
-alive, resident bytes are at most ``R[i+1]`` (only tensors of files ``<= i``
-have been materialized; file i's kept bytes are charged up front) and every
-live transient buffer belongs to file ``i`` or a later file ``j > i``. The
-per-file budget ``B`` declines monotonically with ``R``, so every live
-buffer span is ``<= B[i]``. With at most ``depth`` buffers alive,
+Why per-file budgets are safe (the bound): let ``G(i)`` be the last file of
+file ``i``'s batch group -- the ``group_size`` files loaded concurrently, one
+per rank. While any chunk of file ``i`` is alive, resident bytes are at most
+``R[G(i)+1]`` (only tensors of files ``<= G(i)`` have been materialized; the
+group's kept bytes are charged up front, because broadcast leaves every rank
+holding every file of the group) and every live transient buffer belongs to
+file ``i`` or a later file ``j > i``. The per-file budget ``B`` declines
+monotonically with ``R``, so every live buffer span is ``<= B[i]``. With at
+most ``depth`` buffers alive on any one rank,
 
-    peak <= R[i+1] + depth * B[i] <= budget      (by choice of B[i]).
+    peak <= R[G(i)+1] + depth * B[i] <= budget   (by choice of B[i]).
+
+With ``group_size == 1``, ``G(i) == i`` and this reduces to ``R[i+1]``.
+
+The budget itself is the caller's to choose -- only the caller knows what
+else will live on the device. A caller sizing it from free memory should
+keep a reserve for allocator rounding and the copier's fixed pools (5% or
+1 GiB, whichever is larger, is a reasonable starting point), e.g.::
+
+    free, _ = torch.cuda.mem_get_info(dev)
+    budget = free - max(free // 20, 1 << 30)
+
+and, under broadcast loading, all-reduce(MIN) that value before passing it:
+per-rank readings diverge, and differing budgets would give ranks different
+plans and deadlock the lockstep broadcast sequence.
 """
 
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Set, Tuple
 
 from .common import SafeTensorsMetadata
-
-GiB = 1024**3
 
 
 def plan_chunks(
@@ -123,13 +138,6 @@ def pipeline_depth(queue_size: int) -> int:
     return queue_size + 2
 
 
-def resolve_auto_budget(free_bytes: int) -> int:
-    """Budget from a free-device-memory reading: keep a reserve of
-    max(5% of free, 1 GiB) for allocator rounding and small runtime
-    allocations. Explicit integer budgets bypass this."""
-    return max(0, free_bytes - max(free_bytes // 20, GiB))
-
-
 def collect_file_stats(
     metas: List[Tuple[str, SafeTensorsMetadata]],
     keep_tensor: Optional[Callable[[str], bool]] = None,
@@ -161,6 +169,7 @@ def plan_file_budgets(
     max_batch_bytes: Optional[int] = None,
     accumulate_resident: bool = True,
     transient_multiplier: int = 1,
+    group_size: int = 1,
 ) -> List[int]:
     """Per-file chunk budgets satisfying the peak-memory bound.
 
@@ -170,15 +179,21 @@ def plan_file_budgets(
     (e.g. copying into preallocated model parameters): resident growth is 0
     and the plan degenerates to a uniform budget of ``budget / depth``.
 
-    ``transient_multiplier`` scales the per-buffer transient cost. On the
-    O_DIRECT reader path each in-flight chunk costs ~1x its span plus a small
-    fixed thread-pool (measured on GB10 unified memory: +~150 MB regardless of
-    chunk size, covered by the auto-budget reserve), so 1 is correct even on
-    unified-memory systems. The mmap+pin_memory fallback additionally pins the
-    chunk's file pages for the copy's lifetime -- on unified memory that draws
-    from the same physical pool as the device buffer, so each in-flight chunk
-    costs ~2x its span: pass 2 when the fallback will be used (see
-    ``unified.chunk_transient_multiplier``).
+    ``transient_multiplier`` scales the per-buffer transient cost: how many
+    times over the copier stages each in-flight chunk. Only the copier knows
+    (its reader path decides), so callers pass
+    ``CopierInterface.chunk_transient_multiplier(paths)``. Fixed overheads
+    that do not scale with chunk size -- bounce-buffer pools, the O_DIRECT
+    reader's thread pool (measured on GB10 unified memory: +~150 MB regardless
+    of chunk size) -- are not modelled here and must be left outside the
+    budget the caller passes.
+
+    ``group_size`` is the number of files loaded concurrently, one per rank
+    (``pg.size()`` under broadcast loading, 1 otherwise). Every rank ends up
+    with every tensor of the group, so a whole group's kept bytes become
+    resident together and each file in it is charged the group total rather
+    than its own prefix -- otherwise the bound below under-counts by up to
+    ``group_size - 1`` files whenever shard sizes are uneven.
 
     Returns one budget per file; feed each to
     ``SafeTensorsMetadata.plan_chunks``. A budget >= the file's span yields a
@@ -195,12 +210,24 @@ def plan_file_budgets(
         raise ValueError(
             f"transient_multiplier must be >= 1, got {transient_multiplier}"
         )
+    if group_size < 1:
+        raise ValueError(f"group_size must be >= 1, got {group_size}")
     eff_depth = depth * transient_multiplier
+    # Cumulative kept bytes through the end of each file's batch group. With
+    # group_size == 1 this is just R[i+1]; under broadcast the whole group is
+    # in flight at once, so every file in it is charged the group's total.
+    kept_through_group = []
+    running = 0
+    for end in range(len(stats)):
+        running += stats[end].kept_bytes
+        kept_through_group.append(running)
+    group_resident = [
+        kept_through_group[min((i // group_size + 1) * group_size, len(stats)) - 1]
+        for i in range(len(stats))
+    ]
     budgets = []
-    resident = 0
-    for st in stats:
-        if accumulate_resident:
-            resident += st.kept_bytes
+    for i, st in enumerate(stats):
+        resident = group_resident[i] if accumulate_resident else 0
         b = (device_memory_budget - resident) // eff_depth
         if max_batch_bytes is not None:
             b = min(b, max_batch_bytes)

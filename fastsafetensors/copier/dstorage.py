@@ -177,7 +177,7 @@ class DStorageFileCopier(CopierInterface):
         )
 
 
-@register_copier_constructor("dstorage")
+@register_copier_constructor("dstorage", DStorageFileCopier)
 def new_dstorage_copier(device: Device, **kwargs) -> CopierConstructFunc:
     """Factory for DirectStorage file copier."""
     init_dstorage(device.index if device.index is not None else 0)

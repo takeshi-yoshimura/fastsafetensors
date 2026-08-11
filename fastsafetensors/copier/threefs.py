@@ -70,7 +70,7 @@ class ThreeFSFileCopier(CopierInterface):
         )
 
 
-@register_copier_constructor("3fs")
+@register_copier_constructor("3fs", ThreeFSFileCopier)
 def new_threefs_file_copier(
     device: Device,
     mount_point: str,

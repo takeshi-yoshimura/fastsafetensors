@@ -90,6 +90,25 @@ class CopierInterface(ABC):
             f"Use the nogds or unified copier, or unset max_batch_bytes."
         )
 
+    @classmethod
+    def chunk_transient_multiplier(cls, paths: List[str]) -> int:
+        """Transient device bytes this copier holds per in-flight chunk, as a
+        multiple of the chunk's span, when loading *paths*.
+
+        The fit planner (``ParallelLoader(device_memory_budget=...)``) charges
+        every live buffer this multiple of its budget, so a copier that stages
+        a chunk twice must say so or the plan under-counts and OOMs. Fixed
+        overheads that do not scale with chunk size (bounce-buffer pools,
+        reader thread pools) are not counted here. Like ``set_chunk``, the
+        default refuses rather than guessing: chunking copiers override it.
+        """
+        raise NotImplementedError(
+            f"device_memory_budget needs a copier that overrides "
+            f"chunk_transient_multiplier; {cls.__name__} does not implement "
+            f"sub-file chunking. Use the nogds or unified copier, or unset "
+            f"device_memory_budget."
+        )
+
     @abstractmethod
     def submit_io(
         self, use_buf_register: bool, max_copy_block_size: int
