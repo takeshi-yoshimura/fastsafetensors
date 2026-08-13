@@ -79,6 +79,46 @@ def test_windows_uses_framework_bundled_cudart(monkeypatch):
         assert result == str(cudart.absolute())
 
 
+def test_windows_uses_highest_bundled_cudart_major(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.delenv("FASTSAFETENSORS_CUDART_LIB", raising=False)
+    monkeypatch.delenv("CUDA_HOME", raising=False)
+    monkeypatch.delenv("CUDA_PATH", raising=False)
+    with tempfile.TemporaryDirectory() as tmp:
+        runtime_dir = Path(tmp) / "torch" / "lib"
+        runtime_dir.mkdir(parents=True)
+        (runtime_dir / "cudart64_9.dll").touch()
+        cudart = runtime_dir / "cudart64_12.dll"
+        cudart.touch()
+
+        result = common.resolve_runtime_lib_name(
+            _FakeFramework("cuda-12.8", [str(runtime_dir)])
+        )
+
+        assert result == str(cudart.absolute())
+
+
+def test_windows_uses_highest_installed_cuda_version(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.delenv("FASTSAFETENSORS_CUDART_LIB", raising=False)
+    monkeypatch.delenv("CUDA_HOME", raising=False)
+    monkeypatch.delenv("CUDA_PATH", raising=False)
+    with tempfile.TemporaryDirectory() as tmp:
+        cuda_base = Path(tmp) / "NVIDIA GPU Computing Toolkit" / "CUDA"
+        old_bin = cuda_base / "v9.0" / "bin"
+        old_bin.mkdir(parents=True)
+        (old_bin / "cudart64_9.dll").touch()
+        new_bin = cuda_base / "v12.6" / "bin"
+        new_bin.mkdir(parents=True)
+        cudart = new_bin / "cudart64_12.dll"
+        cudart.touch()
+        monkeypatch.setenv("ProgramFiles", tmp)
+
+        result = common.resolve_runtime_lib_name()
+
+        assert result == str(cudart.absolute())
+
+
 def test_windows_explicit_cudart_takes_precedence(monkeypatch):
     monkeypatch.setattr(sys, "platform", "win32")
     with tempfile.TemporaryDirectory() as tmp:

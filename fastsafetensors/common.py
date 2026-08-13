@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -139,10 +140,14 @@ def _resolve_windows_cudart_lib_name(framework=None) -> str:
         d = os.path.abspath(expanded)
         if not os.path.isdir(d):
             return ""
-        matches = glob.glob(os.path.join(d, "cudart64*.dll"))
+        matches = []
+        for path in glob.glob(os.path.join(d, "cudart64_*.dll")):
+            match = re.fullmatch(r"cudart64_(\d+)\.dll", os.path.basename(path))
+            if match:
+                matches.append((int(match.group(1)), path))
         if matches:
-            matches.sort(reverse=True)
-            return os.path.abspath(matches[0])
+            matches.sort(key=lambda item: item[0], reverse=True)
+            return os.path.abspath(matches[0][1])
         return ""
 
     def _detect_from_nvcc(cuda_home: str) -> str:
@@ -199,7 +204,15 @@ def _resolve_windows_cudart_lib_name(framework=None) -> str:
     if os.path.isdir(nvidia_base):
         # List version directories (e.g. v12.6, v11.8), newest first
         try:
-            versions = sorted(os.listdir(nvidia_base), reverse=True)
+            versions = sorted(
+                (
+                    version
+                    for version in os.listdir(nvidia_base)
+                    if re.fullmatch(r"v\d+(?:\.\d+)*", version)
+                ),
+                key=lambda version: tuple(int(part) for part in version[1:].split(".")),
+                reverse=True,
+            )
         except OSError:
             versions = []
         for ver_dir in versions:
