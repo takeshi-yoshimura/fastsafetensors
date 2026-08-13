@@ -12,6 +12,7 @@ from typing import (
     OrderedDict,
     Set,
     Tuple,
+    Type,
     Union,
 )
 
@@ -22,7 +23,13 @@ from .common import (
     get_device_numa_node,
     init_logger,
 )
-from .copier import CopierConstructFunc, CopierType, create_copier_constructor
+from .copier import (
+    CopierConstructFunc,
+    CopierInterface,
+    CopierType,
+    copier_class_of,
+    create_copier_constructor,
+)
 from .copier.unified import is_unified_memory_system
 from .file_buffer import FilesBufferOnDevice
 from .frameworks import TensorBase, get_framework_op
@@ -86,6 +93,14 @@ class BaseSafeTensorsFileLoader:
             device=device,
             framework=self.framework,
             **kwargs,
+        )
+        # The class behind copier_constructor, for policy the planner needs
+        # before any copier exists (chunk_transient_multiplier). Read off the
+        # constructor rather than copier_type: asking for "gds" on a host
+        # without cuFile hands back a nogds/unified constructor, and the plan
+        # has to reflect the copier that will really run.
+        self.copier_class: Type[CopierInterface] = copier_class_of(
+            self.copier_constructor
         )
 
     def init_numa(self, set_numa: bool = True):

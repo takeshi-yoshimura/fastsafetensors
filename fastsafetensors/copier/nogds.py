@@ -65,6 +65,17 @@ class NoGdsFileCopier(CopierInterface):
         self.byte_ranges = byte_ranges
         self._chunk_names = names
 
+    @classmethod
+    def chunk_transient_multiplier(cls, paths: List[str]) -> int:
+        """Per in-flight-chunk transient cost, as a multiple of chunk span: 1.
+
+        Reads land in the reader's fixed pool of host bounce buffers
+        (``bbuf_size_kb`` x ``max_threads``, sized independently of the chunk),
+        so the only device-side allocation that scales with a chunk is the
+        chunk buffer itself.
+        """
+        return 1
+
     def submit_io(
         self, use_buf_register: bool, max_copy_block_size: int
     ) -> fstcpp.gds_device_buffer:
@@ -142,7 +153,7 @@ def load_library_func(framework=None):
     _loaded_library = True
 
 
-@register_copier_constructor("nogds")
+@register_copier_constructor("nogds", NoGdsFileCopier)
 def new_nogds_file_copier(
     device: Device,
     bbuf_size_kb: int = 16 * 1024,

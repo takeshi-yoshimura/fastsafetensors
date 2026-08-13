@@ -38,6 +38,13 @@ class LoaderConfig:
     # Must be >= the largest single tensor. See _planner.plan_chunks.
     max_batch_bytes: Optional[int] = None
 
+    # Bound the load's total device footprint in bytes (resident tensors +
+    # transient buffers) per rank via a static fit plan: whole-file loads while
+    # headroom is ample, chunking only where the fit requires it. The caller
+    # picks the number; under broadcast loading it must be identical on every
+    # rank. See fastsafetensors._planner.
+    device_memory_budget: Optional[int] = None
+
     _extensions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -112,6 +119,7 @@ class LoaderConfig:
         # Memory knobs apply with or without pipelining.
         common: Dict[str, Any] = {
             "max_batch_bytes": self.max_batch_bytes,
+            "device_memory_budget": self.device_memory_budget,
         }
         if not self.use_pipeline:
             # queue_size=-1: fully serial (copy_files → broadcast → copy_files),

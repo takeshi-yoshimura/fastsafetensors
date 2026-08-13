@@ -11,7 +11,9 @@ from .nogds import NoGdsFileCopier
 from .registry import (
     CopierConstructFunc,
     CopierType,
+    copier_class_of,
     create_copier_constructor,
+    get_copier_class,
     register_copier_constructor,
 )
 from .threefs import ThreeFSFileCopier
