@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -103,7 +104,7 @@ def resolve_runtime_lib_name(framework=None) -> str:
     back to auto-detection.
     """
     if sys.platform == "win32":
-        return _resolve_windows_cudart_lib_name()
+        return _resolve_windows_cudart_lib_name(framework)
     if framework is None:
         return ""
     try:
@@ -120,7 +121,7 @@ def resolve_runtime_lib_name(framework=None) -> str:
     return ""
 
 
-def _resolve_windows_cudart_lib_name() -> str:
+def _resolve_windows_cudart_lib_name(framework=None) -> str:
     """Resolve the absolute cudart DLL path on Windows, "" for the default."""
     # Allow explicit override via environment variable
     override = os.environ.get("FASTSAFETENSORS_CUDART_LIB", "").strip()
@@ -139,10 +140,14 @@ def _resolve_windows_cudart_lib_name() -> str:
         d = os.path.abspath(expanded)
         if not os.path.isdir(d):
             return ""
-        matches = glob.glob(os.path.join(d, "cudart64_*.dll"))
+        matches = []
+        for path in glob.glob(os.path.join(d, "cudart64_*.dll")):
+            match = re.fullmatch(r"cudart64_(\d+)\.dll", os.path.basename(path))
+            if match:
+                matches.append((int(match.group(1)), path))
         if matches:
-            matches.sort(reverse=True)
-            return os.path.abspath(matches[0])
+            matches.sort(key=lambda item: item[0], reverse=True)
+            return os.path.abspath(matches[0][1])
         return ""
 
     def _detect_from_nvcc(cuda_home: str) -> str:
@@ -171,6 +176,18 @@ def _resolve_windows_cudart_lib_name() -> str:
         except Exception:
             return ""
 
+    # Framework wheels such as PyTorch can bundle cudart without installing a
+    # system CUDA Toolkit.
+    if framework is not None:
+        try:
+            runtime_dirs = framework.get_runtime_lib_dirs()
+        except (AttributeError, OSError):
+            runtime_dirs = []
+        for runtime_dir in runtime_dirs:
+            result = _find_cudart_in_dir(runtime_dir)
+            if result:
+                return result
+
     # Try to detect from CUDA_HOME / CUDA_PATH
     cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
     if cuda_home:
@@ -187,7 +204,15 @@ def _resolve_windows_cudart_lib_name() -> str:
     if os.path.isdir(nvidia_base):
         # List version directories (e.g. v12.6, v11.8), newest first
         try:
-            versions = sorted(os.listdir(nvidia_base), reverse=True)
+            versions = sorted(
+                (
+                    version
+                    for version in os.listdir(nvidia_base)
+                    if re.fullmatch(r"v\d+(?:\.\d+)*", version)
+                ),
+                key=lambda version: tuple(int(part) for part in version[1:].split(".")),
+                reverse=True,
+            )
         except OSError:
             versions = []
         for ver_dir in versions:

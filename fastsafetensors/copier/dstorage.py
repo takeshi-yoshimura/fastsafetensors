@@ -16,16 +16,22 @@ from ..common import (
 from ..frameworks import FrameworkOpBase, TensorBase
 from ..st_types import Device, DeviceType, DType
 from .base import CopierInterface
+from .nogds import new_nogds_file_copier
 from .registry import CopierConstructFunc, register_copier_constructor
 
 logger = init_logger(__name__)
 
 _inited_ds = False
+_warned_dstorage_fallback = False
 _dstorage_dll_dir_handle = None
 _dstorage_dll_dir: Path | None = None
 _DSTORAGE_DLLS = ("dstoragecore.dll", "dstorage.dll")
 _DSTORAGE_DLL_DIR_ENV_VAR = "FASTSAFETENSORS_DSTORAGE_DLL_DIR"
 _LEGACY_DSTORAGE_DOWNLOAD_ENV_VAR = "FASTSAFETENSORS_DSTORAGE_NUPKG_URL"
+
+
+class DirectStorageUnavailableError(RuntimeError):
+    """DirectStorage is not installed in an auto-discovered location."""
 
 
 def _get_dstorage_cache_dir() -> Path:
@@ -71,7 +77,7 @@ def resolve_dstorage_dll_dir() -> Path:
         except FileNotFoundError:
             pass
 
-    raise RuntimeError(
+    raise DirectStorageUnavailableError(
         "DirectStorage DLLs were not found. Install dstoragecore.dll and "
         "dstorage.dll into an absolute directory and set "
         f"{_DSTORAGE_DLL_DIR_ENV_VAR}, or place them in {cache_dir}."
@@ -105,17 +111,17 @@ def load_dstorage_dlls() -> None:
     _dstorage_dll_dir = dll_dir
 
 
-def init_dstorage(device_id: int = 0) -> None:
+def init_dstorage(device_id: int = 0, framework: FrameworkOpBase | None = None) -> None:
     global _inited_ds
     if not _inited_ds:
         from .nogds import load_library_func
 
         load_dstorage_dlls()
-        load_library_func()
+        load_library_func(framework)
         if not is_gpu_found():
             raise RuntimeError("CUDA runtime not found")
         # Windows-only; resolve_runtime_lib_name() returns the cudart DLL path here
-        cudart_dll = resolve_runtime_lib_name()
+        cudart_dll = resolve_runtime_lib_name(framework)
         if not cudart_dll:
             raise RuntimeError("Could not find CUDA runtime DLL")
         if _dstorage_dll_dir is None:
@@ -180,7 +186,21 @@ class DStorageFileCopier(CopierInterface):
 @register_copier_constructor("dstorage", DStorageFileCopier)
 def new_dstorage_copier(device: Device, **kwargs) -> CopierConstructFunc:
     """Factory for DirectStorage file copier."""
-    init_dstorage(device.index if device.index is not None else 0)
+    try:
+        init_dstorage(
+            device.index if device.index is not None else 0,
+            kwargs.get("framework"),
+        )
+    except DirectStorageUnavailableError as e:
+        global _warned_dstorage_fallback
+        if not _warned_dstorage_fallback:
+            _warned_dstorage_fallback = True
+            logger.warning(
+                "DirectStorage is unavailable (%s); falling back to the nogds copier",
+                str(e),
+            )
+        return new_nogds_file_copier(device, **kwargs)
+
     stream_reader = fstcpp.dstorage_stream_reader()
     if not stream_reader.is_ready():
         raise RuntimeError("dstorage_stream_reader failed to initialize")

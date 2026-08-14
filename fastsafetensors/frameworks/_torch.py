@@ -6,6 +6,7 @@ try:
 except ImportError as e:
     raise ImportError("could not import torch. Please install it.") from e
 
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -302,6 +303,13 @@ class TorchOp(FrameworkOpBase[TorchTensor, TorchProcessGroup]):
                 return f"hip-{torch.version.hip}"
             return f"cuda-{torch.version.cuda}"
         return "0.0"
+
+    def get_runtime_lib_dirs(self) -> List[str]:
+        torch_c_file = getattr(getattr(torch, "_C", None), "__file__", None)
+        torch_file = torch_c_file or getattr(torch, "__file__", None)
+        if not torch_file:
+            return []
+        return [os.path.join(os.path.dirname(os.path.abspath(torch_file)), "lib")]
 
     def get_device_ptr_align(self) -> int:
         CUDA_PTR_ALIGN: int = 16
