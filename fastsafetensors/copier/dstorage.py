@@ -111,17 +111,17 @@ def load_dstorage_dlls() -> None:
     _dstorage_dll_dir = dll_dir
 
 
-def init_dstorage(device_id: int = 0) -> None:
+def init_dstorage(device_id: int = 0, framework: FrameworkOpBase | None = None) -> None:
     global _inited_ds
     if not _inited_ds:
         from .nogds import load_library_func
 
         load_dstorage_dlls()
-        load_library_func()
+        load_library_func(framework)
         if not is_gpu_found():
             raise RuntimeError("CUDA runtime not found")
         # Windows-only; resolve_runtime_lib_name() returns the cudart DLL path here
-        cudart_dll = resolve_runtime_lib_name()
+        cudart_dll = resolve_runtime_lib_name(framework)
         if not cudart_dll:
             raise RuntimeError("Could not find CUDA runtime DLL")
         if _dstorage_dll_dir is None:
@@ -187,7 +187,10 @@ class DStorageFileCopier(CopierInterface):
 def new_dstorage_copier(device: Device, **kwargs) -> CopierConstructFunc:
     """Factory for DirectStorage file copier."""
     try:
-        init_dstorage(device.index if device.index is not None else 0)
+        init_dstorage(
+            device.index if device.index is not None else 0,
+            kwargs.get("framework"),
+        )
     except DirectStorageUnavailableError as e:
         global _warned_dstorage_fallback
         if not _warned_dstorage_fallback:

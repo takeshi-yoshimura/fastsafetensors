@@ -137,6 +137,70 @@ def test_windows_explicit_cudart_takes_precedence(monkeypatch):
         assert result == str(override.absolute())
 
 
+def test_dstorage_initialization_uses_framework_bundled_cudart(monkeypatch):
+    import ctypes
+
+    from fastsafetensors.copier import dstorage, nogds
+    from fastsafetensors.st_types import Device
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        runtime_dir = tmp_path / "torch" / "lib"
+        runtime_dir.mkdir(parents=True)
+        cudart = runtime_dir / "cudart64_12.dll"
+        cudart.touch()
+
+        dstorage_dir = tmp_path / "dstorage"
+        dstorage_dir.mkdir()
+        for dll_name in dstorage._DSTORAGE_DLLS:
+            (dstorage_dir / dll_name).touch()
+
+        framework = _FakeFramework("cuda-12.8", [str(runtime_dir)])
+        loaded_runtimes = []
+        init_calls = []
+
+        class _ReadyStreamReader:
+            def is_ready(self):
+                return True
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.delenv("FASTSAFETENSORS_CUDART_LIB", raising=False)
+        monkeypatch.delenv("CUDA_HOME", raising=False)
+        monkeypatch.delenv("CUDA_PATH", raising=False)
+        monkeypatch.setenv("ProgramFiles", str(tmp_path / "no-system-cuda"))
+        monkeypatch.setenv(dstorage._DSTORAGE_DLL_DIR_ENV_VAR, str(dstorage_dir))
+        monkeypatch.setattr(ctypes, "WinDLL", lambda path: None, raising=False)
+        monkeypatch.setattr(
+            dstorage.os, "add_dll_directory", lambda path: object(), raising=False
+        )
+        monkeypatch.setattr(
+            nogds.fstcpp, "load_library_functions", loaded_runtimes.append
+        )
+        monkeypatch.setattr(nogds, "is_gpu_found", lambda: True)
+        monkeypatch.setattr(nogds, "_loaded_library", False)
+        monkeypatch.setattr(dstorage, "is_gpu_found", lambda: True)
+        monkeypatch.setattr(dstorage, "_inited_ds", False)
+        monkeypatch.setattr(dstorage, "_dstorage_dll_dir", None)
+        monkeypatch.setattr(dstorage, "_dstorage_dll_dir_handle", None)
+        monkeypatch.setattr(
+            dstorage.fstcpp,
+            "init_dstorage",
+            lambda *args: init_calls.append(args) or "ok",
+        )
+        monkeypatch.setattr(
+            dstorage.fstcpp, "dstorage_stream_reader", _ReadyStreamReader
+        )
+
+        constructor = dstorage.new_dstorage_copier(
+            Device.from_str("cuda:0"), framework=framework
+        )
+
+        expected_cudart = str(cudart.absolute())
+        assert callable(constructor)
+        assert loaded_runtimes == [expected_cudart]
+        assert init_calls == [(0, 0, expected_cudart, str(dstorage_dir))]
+
+
 def test_load_library_func_hint_with_no_gpu_raises(monkeypatch):
     """A hint that finds no GPU is a hard failure"""
     from fastsafetensors.copier import nogds
