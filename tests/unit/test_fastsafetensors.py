@@ -22,7 +22,28 @@ from fastsafetensors import (
 from fastsafetensors.common import get_device_numa_node, is_gpu_found
 from fastsafetensors.copier.gds import GdsFileCopier
 from fastsafetensors.copier.nogds import NoGdsFileCopier
-from fastsafetensors.copier.unified import UnifiedMemCopier, is_unified_memory_system
+from fastsafetensors.copier.unified import (
+    UnifiedMemCopier,
+    _allocation_length,
+    is_unified_memory_system,
+)
+
+
+def test_unified_allocation_length(monkeypatch) -> None:
+    monkeypatch.delenv("FASTSAFETENSORS_ALLOC_GRANULARITY_MB", raising=False)
+    assert _allocation_length(123) == 123
+
+    monkeypatch.setenv("FASTSAFETENSORS_ALLOC_GRANULARITY_MB", "4")
+    assert _allocation_length(0) == 0
+    assert _allocation_length(1) == 4 * 1024 * 1024
+    assert _allocation_length(4 * 1024 * 1024) == 4 * 1024 * 1024
+    assert _allocation_length(4 * 1024 * 1024 + 1) == 8 * 1024 * 1024
+
+    monkeypatch.setenv("FASTSAFETENSORS_ALLOC_GRANULARITY_MB", "-1")
+    with pytest.raises(ValueError, match="must be >= 0"):
+        _allocation_length(123)
+
+
 from fastsafetensors.dlpack import from_cuda_buffer
 from fastsafetensors.frameworks import FrameworkOpBase
 from fastsafetensors.st_types import Device, DeviceType, DType

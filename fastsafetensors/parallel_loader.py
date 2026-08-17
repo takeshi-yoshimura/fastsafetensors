@@ -47,6 +47,16 @@ def enable_tqdm(
 _BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]\n"
 
 
+def _max_batch_bytes_from_env(value: Optional[int]) -> Optional[int]:
+    """Apply the opt-in sub-shard pipeline size when the API did not set one."""
+    if value is not None:
+        return value
+    size_mb = int(os.environ.get("FASTSAFETENSORS_MAX_BATCH_MB", "0"))
+    if size_mb < 0:
+        raise ValueError("FASTSAFETENSORS_MAX_BATCH_MB must be >= 0")
+    return size_mb * 1024 * 1024 if size_mb else None
+
+
 def parse_time(timestamp_ms):
     """Convert timestamp in milliseconds to formatted string with millisecond precision.
 
@@ -176,7 +186,7 @@ class PipelineParallel:
         # When set, each shard is loaded in sub-file chunks (span <= this many
         # bytes) so peak device buffer per rank is bounded regardless of shard
         # size. See _planner.plan_chunks / CopierInterface.set_chunk.
-        self.max_batch_bytes = max_batch_bytes
+        self.max_batch_bytes = _max_batch_bytes_from_env(max_batch_bytes)
         # When set (bytes), bound the load's TOTAL device footprint (resident
         # tensors + transient buffers) via a static fit plan: whole-file loads
         # while headroom is ample, per-file chunk budgets declining as the
@@ -213,7 +223,10 @@ class PipelineParallel:
             self.consumer_processed.set()  # Initially set to allow first production
 
         # Logging setup - get from environment variable, default to False
-        self.print_log = os.getenv("FASTSAFETENSORS_DEBUG", "false").lower() == "true"
+        self.print_log = (
+            os.getenv("FASTSAFETENSORS_DEBUG", "false").lower() == "true"
+            or os.getenv("FASTSAFETENSORS_PROFILE") == "1"
+        )
         self.log_prefix = f"PG{pg.rank() if pg is not None else 0}"
         # When pg.size() == 1, tensors reference the underlying gbuf memory
         # which will be freed in fb.close(). Clone to ensure data survives.
@@ -527,6 +540,7 @@ class PipelineParallel:
             f"Batch {batch.batch_id} summary: "
             f"add_filenames={batch.add_filenames_time:.3f}ms, "
             f"copy_files={batch.copy_files_time:.3f}ms, "
+            f"queue_wait={queue_wait_time:.3f}ms, "
             f"get_tensor_total={get_tensor_time:.3f}ms, "
             f"close={close_time:.3f}ms, "
             f"num_keys={len(batch.keys)}"

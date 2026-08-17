@@ -3,6 +3,22 @@
 
 import pytest
 
+from fastsafetensors.parallel_loader import _max_batch_bytes_from_env
+
+
+def test_max_batch_bytes_environment(monkeypatch):
+    monkeypatch.delenv("FASTSAFETENSORS_MAX_BATCH_MB", raising=False)
+    assert _max_batch_bytes_from_env(None) is None
+
+    monkeypatch.setenv("FASTSAFETENSORS_MAX_BATCH_MB", "1024")
+    assert _max_batch_bytes_from_env(None) == 1024 * 1024 * 1024
+    assert _max_batch_bytes_from_env(123) == 123
+
+    monkeypatch.setenv("FASTSAFETENSORS_MAX_BATCH_MB", "-1")
+    with pytest.raises(ValueError, match="must be >= 0"):
+        _max_batch_bytes_from_env(None)
+
+
 from fastsafetensors.common import get_fs_type
 
 # ---- get_fs_type: longest-prefix mount matching ----

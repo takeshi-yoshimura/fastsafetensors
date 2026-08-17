@@ -1037,6 +1037,14 @@ static int dma_load_runs(uintptr_t gbuf_dev, const std::string &path,
     char *gbuf = reinterpret_cast<char *>(gbuf_dev);
     const size_t CHUNK = 16UL << 20;
     const size_t ALN = 4096UL;
+    const char *profile_env = std::getenv("FASTSAFETENSORS_PROFILE");
+    const bool profile = profile_env && std::strcmp(profile_env, "1") == 0;
+    const auto wall_begin = std::chrono::steady_clock::now();
+    std::atomic<uint64_t> profile_read_bytes{0}, profile_copy_bytes{0};
+    std::atomic<uint64_t> profile_read_ops{0}, profile_copy_ops{0};
+    std::atomic<uint64_t> profile_pin_us{0}, profile_open_us{0};
+    std::atomic<uint64_t> profile_pread_us{0}, profile_memcpy_us{0};
+    std::atomic<uint64_t> profile_sync_us{0};
     std::atomic<int> rc{0};
     std::vector<std::thread> threads;
 
@@ -1051,12 +1059,16 @@ static int dma_load_runs(uintptr_t gbuf_dev, const std::string &path,
             // contexts and copies land on the right device (device_id < 0 =
             // caller doesn't know, e.g. cpu device: leave the default).
             if (device_id >= 0) cuda_fns.cudaSetDevice(device_id);
+            auto profile_t0 = std::chrono::steady_clock::now();
             void *pinned = pin_acquire();
+            if (profile) profile_pin_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - profile_t0).count();
             if (!pinned) {
                 rc = -1;
                 return;
             }
+            profile_t0 = std::chrono::steady_clock::now();
             int fd = open(path.c_str(), O_RDONLY | O_DIRECT);
+            if (profile) profile_open_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - profile_t0).count();
             if (fd < 0) {
                 rc = -2;
                 pin_release(pinned);
@@ -1077,15 +1089,27 @@ static int dma_load_runs(uintptr_t gbuf_dev, const std::string &path,
                     size_t want = fend - fo;
                     size_t reqlen = (want >= CHUNK) ? CHUNK
                                                     : ((want + ALN - 1) & ~(ALN - 1));
+                    profile_t0 = std::chrono::steady_clock::now();
                     ssize_t got = pread(fd, pinned, reqlen, fo);
+                    if (profile) {
+                        profile_pread_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - profile_t0).count();
+                        profile_read_ops++;
+                        if (got > 0) profile_read_bytes += (uint64_t)got;
+                    }
                     if (got <= 0) { rc = -3; break; }
                     size_t fo_end = fo + (size_t)got;
                     size_t cs = fo > fstart ? fo : fstart;  // copy only [fstart,fend)
                     size_t ce = fo_end < fend ? fo_end : fend;
                     if (cs < ce) {
+                        profile_t0 = std::chrono::steady_clock::now();
                         cudaError_t e = cuda_fns.cudaMemcpy(
                             gbuf + (cs - header_len), (char *)pinned + (cs - fo),
                             ce - cs, cudaMemcpyHostToDevice);
+                        if (profile) {
+                            profile_memcpy_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - profile_t0).count();
+                            profile_copy_ops++;
+                            profile_copy_bytes += (uint64_t)(ce - cs);
+                        }
                         if (e != cudaSuccess) { rc = -4; break; }
                     }
                     if (fo_end >= fend) break;
@@ -1093,12 +1117,19 @@ static int dma_load_runs(uintptr_t gbuf_dev, const std::string &path,
             }
             // Synchronize on this thread (its current device is the target);
             // the calling thread may have a different device current.
+            profile_t0 = std::chrono::steady_clock::now();
             cuda_fns.cudaDeviceSynchronize();
+            if (profile) profile_sync_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - profile_t0).count();
             close(fd);
             pin_release(pinned);
         });
     }
     for (auto &t : threads) t.join();
+    if (profile) {
+        const uint64_t wall_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - wall_begin).count();
+        std::fprintf(stderr, "[FST_PROFILE] dma file=%s requested=%zu read=%" PRIu64 " copied=%" PRIu64 " threads=%zu read_ops=%" PRIu64 " copy_ops=%" PRIu64 " wall_ms=%.3f pin_worker_ms=%.3f open_worker_ms=%.3f pread_worker_ms=%.3f memcpy_worker_ms=%.3f sync_worker_ms=%.3f rc=%d\n", path.c_str(), total, profile_read_bytes.load(), profile_copy_bytes.load(), threads.size(), profile_read_ops.load(), profile_copy_ops.load(), wall_us/1000.0, profile_pin_us.load()/1000.0, profile_open_us.load()/1000.0, profile_pread_us.load()/1000.0, profile_memcpy_us.load()/1000.0, profile_sync_us.load()/1000.0, rc.load());
+        std::fflush(stderr);
+    }
     return rc.load();
 }
 
