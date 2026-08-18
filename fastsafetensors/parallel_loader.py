@@ -191,6 +191,10 @@ class PipelineParallel:
         # plan degenerates to a uniform per-file budget.
         self.accumulate_resident = accumulate_resident
 
+        # When pg.size() == 1, tensors reference the underlying gbuf memory
+        # which will be freed in fb.close(). Clone to ensure data survives.
+        self.need_clone = pg.size() == 1 if pg is not None else True
+
         # Batch files (or, with max_batch_bytes / device_memory_budget,
         # sub-file chunk-batches)
         self.weight_files_batches = self._create_batches(pg)
@@ -215,9 +219,6 @@ class PipelineParallel:
         # Logging setup - get from environment variable, default to False
         self.print_log = os.getenv("FASTSAFETENSORS_DEBUG", "false").lower() == "true"
         self.log_prefix = f"PG{pg.rank() if pg is not None else 0}"
-        # When pg.size() == 1, tensors reference the underlying gbuf memory
-        # which will be freed in fb.close(). Clone to ensure data survives.
-        self.need_clone = pg.size() == 1 if pg is not None else True
 
         fstcpp.set_gil_release(True)
 
@@ -266,6 +267,13 @@ class PipelineParallel:
             # batch_size also sets the group width: those files load together,
             # one per rank, and every rank keeps all of them.
             depth = pipeline_depth(self.queue_size) + (1 if batch_size > 1 else 0)
+            # In a single-process loader, get_tensor returns a view into the
+            # live chunk and iterate_weights clones it before yielding. When
+            # the consumer does not accumulate yielded tensors, that clone is
+            # not resident growth and must be budgeted as one additional
+            # tensor-sized transient allocation. A tensor cannot exceed its
+            # containing chunk, so one extra buffer is a safe bound.
+            clone_buffers = int(self.need_clone and not self.accumulate_resident)
             # How much transient device memory a live chunk costs is the
             # copier's own business (e.g. the unified copier's mmap+pin
             # fallback pins the chunk's pages alongside the device buffer,
@@ -280,6 +288,7 @@ class PipelineParallel:
                 accumulate_resident=self.accumulate_resident,
                 transient_multiplier=multiplier,
                 group_size=batch_size,
+                extra_transient_buffers=clone_buffers,
             )
             per_file_budget = {f: b for (f, _), b in zip(metas, budgets)}
             meta_by_path = dict(metas)

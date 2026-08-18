@@ -219,6 +219,18 @@ def test_accumulate_resident_false_is_uniform():
     assert budgets == [6 * GiB] * 6
 
 
+def test_extra_transient_buffer_reduces_uniform_budget():
+    stats = [_st(f"f{i}", 8 * GiB, largest=1 * GiB) for i in range(6)]
+    budgets = plan_file_budgets(
+        stats,
+        12 * GiB,
+        depth=2,
+        accumulate_resident=False,
+        extra_transient_buffers=1,
+    )
+    assert budgets == [4 * GiB] * 6
+
+
 def test_infeasible_raises_with_details():
     # 10 files x 2 GiB resident vs 12 GiB budget: infeasible partway through
     stats = [_st(f"f{i}", 2 * GiB, largest=1 * GiB) for i in range(10)]
@@ -242,6 +254,8 @@ def test_nonpositive_budget_and_bad_depth():
         plan_file_budgets([_st("f", 1)], 1, depth=0)
     with pytest.raises(ValueError, match="group_size"):
         plan_file_budgets([_st("f", 1)], 1, depth=1, group_size=0)
+    with pytest.raises(ValueError, match="extra_transient_buffers"):
+        plan_file_budgets([_st("f", 1)], 1, depth=1, extra_transient_buffers=-1)
 
 
 def test_empty_kept_file_contributes_nothing():
@@ -426,6 +440,44 @@ def test_parallel_loader_device_memory_budget_cpu(input_files, framework):
     assert set(got.keys()) == set(expected.keys())
     for k in expected:
         assert torch.equal(got[k], expected[k]), k
+
+
+@pytest.mark.parametrize(
+    ("accumulate_resident", "expected_extra_buffers"), [(True, 0), (False, 1)]
+)
+def test_single_process_loader_budgets_yield_clone(
+    input_files,
+    framework,
+    monkeypatch,
+    accumulate_resident,
+    expected_extra_buffers,
+):
+    if framework.get_name() != "pytorch":
+        pytest.skip("pytorch-only integration test")
+
+    from fastsafetensors import ParallelLoader
+    from fastsafetensors import _planner
+
+    captured = {}
+    real_plan_file_budgets = _planner.plan_file_budgets
+
+    def record_plan(*args, **kwargs):
+        captured.update(kwargs)
+        return real_plan_file_budgets(*args, **kwargs)
+
+    monkeypatch.setattr(_planner, "plan_file_budgets", record_plan)
+    pl = ParallelLoader(
+        pg=None,
+        hf_weights_files=[input_files[0]],
+        device="cpu",
+        nogds=True,
+        use_tqdm_on_load=False,
+        device_memory_budget=1 << 30,
+        accumulate_resident=accumulate_resident,
+    )
+
+    assert pl.need_clone is True
+    assert captured["extra_transient_buffers"] == expected_extra_buffers
 
 
 def test_transient_multiplier_infeasible():
