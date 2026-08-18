@@ -250,6 +250,29 @@ class TestPipelineParallelSingleProcess:
         assert pipeline.log_prefix == "PG0"
         assert pipeline.need_clone is True
 
+    def test_borrowed_tensors_disable_clone(self):
+        loader = MagicMock()
+
+        pipeline = PipelineParallel(
+            None,
+            loader,
+            ["a.safetensors"],
+            accumulate_resident=False,
+            borrowed_tensors=True,
+        )
+
+        assert pipeline.borrowed_tensors is True
+        assert pipeline.need_clone is False
+
+    def test_borrowed_tensors_reject_resident_accumulation(self):
+        with pytest.raises(ValueError, match="accumulate_resident=False"):
+            PipelineParallel(
+                None,
+                MagicMock(),
+                ["a.safetensors"],
+                borrowed_tensors=True,
+            )
+
 
 class TestAutoLoaderConfigDiscovery:
     """Test config file discovery (env var > default path > defaults)."""

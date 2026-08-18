@@ -443,13 +443,15 @@ def test_parallel_loader_device_memory_budget_cpu(input_files, framework):
 
 
 @pytest.mark.parametrize(
-    ("accumulate_resident", "expected_extra_buffers"), [(True, 0), (False, 1)]
+    ("accumulate_resident", "borrowed_tensors", "expected_extra_buffers"),
+    [(True, False, 0), (False, False, 1), (False, True, 0)],
 )
 def test_single_process_loader_budgets_yield_clone(
     input_files,
     framework,
     monkeypatch,
     accumulate_resident,
+    borrowed_tensors,
     expected_extra_buffers,
 ):
     if framework.get_name() != "pytorch":
@@ -474,9 +476,10 @@ def test_single_process_loader_budgets_yield_clone(
         use_tqdm_on_load=False,
         device_memory_budget=1 << 30,
         accumulate_resident=accumulate_resident,
+        borrowed_tensors=borrowed_tensors,
     )
 
-    assert pl.need_clone is True
+    assert pl.need_clone is not borrowed_tensors
     assert captured["extra_transient_buffers"] == expected_extra_buffers
 
 

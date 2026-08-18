@@ -144,6 +144,7 @@ class PipelineParallel:
         max_batch_bytes: Optional[int] = None,
         device_memory_budget: Optional[int] = None,
         accumulate_resident: bool = True,
+        borrowed_tensors: bool = False,
         **kwargs,
     ):
 
@@ -191,9 +192,21 @@ class PipelineParallel:
         # plan degenerates to a uniform per-file budget.
         self.accumulate_resident = accumulate_resident
 
+        if borrowed_tensors and accumulate_resident:
+            raise ValueError(
+                "borrowed_tensors requires accumulate_resident=False because "
+                "yielded tensors must be copied before the iterator advances"
+            )
+        if borrowed_tensors and pg.size() != 1:
+            raise ValueError(
+                "borrowed_tensors is only supported by a single-process loader"
+            )
+        self.borrowed_tensors = borrowed_tensors
+
         # When pg.size() == 1, tensors reference the underlying gbuf memory
-        # which will be freed in fb.close(). Clone to ensure data survives.
-        self.need_clone = pg.size() == 1 if pg is not None else True
+        # which will be freed in fb.close(). Clone to ensure data survives unless
+        # the caller explicitly accepts the borrowed-tensor lifetime contract.
+        self.need_clone = pg.size() == 1 and not borrowed_tensors
 
         # Batch files (or, with max_batch_bytes / device_memory_budget,
         # sub-file chunk-batches)
@@ -580,6 +593,10 @@ class PipelineParallel:
         Yields:
             Tuple[str, Any]: Key-value pairs of tensor names and framework
             tensors (e.g. torch.Tensor for the pytorch framework)
+
+        Warning:
+            With ``borrowed_tensors=True``, each yielded tensor is a borrowed
+            view and must be copied before requesting the next iterator item.
         """
         self._log_message("Starting ParallelLoader iterate_weights")
 
@@ -644,6 +661,11 @@ class ParallelLoader(PipelineParallel):
                          broadcast (e.g. expert-parallel slicing). The EP
                          rank/size for the filter come from the real
                          distributed world, independent of the loader's group.
+        borrowed_tensors (bool): If True, skip the single-process clone and
+                         yield borrowed views into the active file buffer. The
+                         caller must copy each tensor before advancing the
+                         iterator. Requires accumulate_resident=False and a
+                         single-process loader. Defaults to False.
 
     Additional GPU memory consumption: (max_concurrent_producers + queue_size) * file_size
     To reduce GPU memory consumption, re-accessing tensors that have already been accessed is prohibited.
@@ -675,6 +697,7 @@ class ParallelLoader(PipelineParallel):
         max_batch_bytes: Optional[int] = None,
         device_memory_budget: Optional[int] = None,
         accumulate_resident: bool = True,
+        borrowed_tensors: bool = False,
         **kwargs,
     ):
         """Initialize PipelineParallelLoader with a pre-configured SafeTensorsFileLoader.
@@ -721,5 +744,6 @@ class ParallelLoader(PipelineParallel):
             max_batch_bytes=max_batch_bytes,
             device_memory_budget=device_memory_budget,
             accumulate_resident=accumulate_resident,
+            borrowed_tensors=borrowed_tensors,
             **kwargs,
         )
