@@ -45,6 +45,7 @@ typedef enum cudaError { cudaSuccess = 0, cudaErrorMemoryAllocation = 2 } cudaEr
 enum cudaDeviceAttr {cudaDevAttrGPUDirectRDMASupported = 116};
 enum cudaMemcpyKind { cudaMemcpyHostToDevice=1, cudaMemcpyDefault = 4, cudaMemcpyDeviceToHost=2, cudaMemcpyDeviceToDevice=3 };
 typedef void * cudaStream_t;
+static const unsigned int cudaStreamNonBlocking = 1;
 
 enum cudaExternalMemoryHandleType {
     cudaExternalMemoryHandleTypeOpaqueFd           = 1,
@@ -166,16 +167,22 @@ private:
         std::condition_variable _result_cond;
         std::map<int, void *> _results;
         void * _read_buffer;
+        cudaStream_t * _streams;
         const bool _use_mmap;
+        const bool _use_async;
         const uint64_t _bbuf_size_kb;
         const uint64_t _max_threads;
+        const int _numa_node;
+        std::atomic<bool> _numa_affinity_warned{false};
     } thread_states_t;
     thread_states_t _s;
 public:
-    nogds_file_reader(const bool use_mmap, const uint64_t bbuf_size_kb, const uint64_t max_threads, bool use_cuda, int device_id):
+    nogds_file_reader(const bool use_mmap, const uint64_t bbuf_size_kb, const uint64_t max_threads, bool use_cuda, int device_id, bool use_async = false, int numa_node = -1):
         _next_thread_id(1), _threads(nullptr), _fns(use_cuda?&cuda_fns:&cpu_fns), _device_id(device_id),
-        _s(thread_states_t{._read_buffer = nullptr, ._use_mmap = use_mmap,
-            ._bbuf_size_kb = (bbuf_size_kb + max_threads - 1)/max_threads, ._max_threads = max_threads})
+        _s(thread_states_t{._read_buffer = nullptr, ._streams = nullptr,
+            ._use_mmap = use_mmap, ._use_async = use_cuda && use_async,
+            ._bbuf_size_kb = (bbuf_size_kb + max_threads - 1)/max_threads,
+            ._max_threads = max_threads, ._numa_node = numa_node})
          {}
 
     static void _thread(const int thread_id, ext_funcs_t *fns, const int device_id, const int fd, const gds_device_buffer& dst, const int64_t offset, const int64_t length, const uint64_t ptr_off, thread_states_t *s); // not exposed to python
@@ -238,6 +245,9 @@ typedef struct ext_funcs {
     ssize_t (*cuFileRead)(CUfileHandle_t, void *, size_t, off_t, off_t);
     cudaError_t (*cudaMemcpy)(void *, const void *, size_t, enum cudaMemcpyKind);
     cudaError_t (*cudaMemcpyAsync)(void *, const void *, size_t, enum cudaMemcpyKind, cudaStream_t);
+    cudaError_t (*cudaStreamCreateWithFlags)(cudaStream_t *, unsigned int);
+    cudaError_t (*cudaStreamSynchronize)(cudaStream_t);
+    cudaError_t (*cudaStreamDestroy)(cudaStream_t);
     cudaError_t (*cudaDeviceSynchronize)(void);
     cudaError_t (*cudaHostAlloc)(void **, size_t, unsigned int);
     cudaError_t (*cudaFreeHost)(void *);

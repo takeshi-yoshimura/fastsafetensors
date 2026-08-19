@@ -25,6 +25,7 @@ class GdsFileCopier(CopierInterface):
         reader: fstcpp.gds_file_reader,
         framework: FrameworkOpBase,
         fallback_cache: Optional[List[CopierConstructFunc]] = None,
+        set_numa: bool = True,
     ):
         self.framework = framework
         self.metadata = metadata
@@ -39,6 +40,7 @@ class GdsFileCopier(CopierInterface):
         # broken-GDS host builds a single nogds fallback reader (and its
         # pinned bounce buffer) per loader instead of one per file.
         self._fallback_cache = fallback_cache
+        self.set_numa = set_numa
         cuda_ver = framework.get_cuda_ver()
         if cuda_ver and cuda_ver != "0.0":
             # Parse version string (e.g., "cuda-12.1" or "hip-5.7.0")
@@ -100,7 +102,11 @@ class GdsFileCopier(CopierInterface):
             if self._fallback_cache is not None:
                 if not self._fallback_cache:
                     self._fallback_cache.append(
-                        new_nogds_file_copier(self.device, framework=self.framework)
+                        new_nogds_file_copier(
+                            self.device,
+                            framework=self.framework,
+                            set_numa=self.set_numa,
+                        )
                     )
                 self._fallback = self._fallback_cache[0](
                     self.metadata, self.device, self.framework
@@ -109,7 +115,9 @@ class GdsFileCopier(CopierInterface):
                 # direct construction (no factory): reader lives only for this
                 # file's submit/wait cycle and is released in wait_io
                 self._fallback = new_nogds_file_copier(
-                    self.device, framework=self.framework
+                    self.device,
+                    framework=self.framework,
+                    set_numa=self.set_numa,
                 )(self.metadata, self.device, self.framework)
             return self._fallback.submit_io(use_buf_register, max_copy_block_size)
         offset = self.metadata.header_length
@@ -261,6 +269,7 @@ def new_gds_file_copier(
             nogds = True
 
     device_id = device.index if device.index is not None else 0
+    set_numa = kwargs.get("set_numa", True)
     if nogds:
         # Prefer unified copier on systems with shared CPU/GPU memory
         from .unified import is_unified_memory_system, new_unified_copier
@@ -268,7 +277,11 @@ def new_gds_file_copier(
         if device_is_not_cpu and is_unified_memory_system(kwargs.get("framework")):
             return new_unified_copier(device, framework=kwargs.get("framework"))
         return new_nogds_file_copier(
-            device, bbuf_size_kb, max_threads, framework=kwargs.get("framework")
+            device,
+            bbuf_size_kb,
+            max_threads,
+            framework=kwargs.get("framework"),
+            set_numa=set_numa,
         )
 
     reader = fstcpp.gds_file_reader(max_threads, device_is_not_cpu, device_id)
@@ -281,7 +294,12 @@ def new_gds_file_copier(
         framework: FrameworkOpBase,
     ) -> CopierInterface:
         return GdsFileCopier(
-            metadata, device, reader, framework, fallback_cache=fallback_cache
+            metadata,
+            device,
+            reader,
+            framework,
+            fallback_cache=fallback_cache,
+            set_numa=set_numa,
         )
 
     return construct_copier

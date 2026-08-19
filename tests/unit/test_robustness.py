@@ -131,6 +131,71 @@ def test_odirect_env_override(monkeypatch):
     assert unified._odirect_ok("/data/f") is False  # forced off
 
 
+# ---- NoGDS parallel copy requests ----
+
+
+def test_nogds_copy_mode_env(monkeypatch):
+    from fastsafetensors.copier import nogds
+
+    monkeypatch.delenv(nogds._COPY_MODE_ENV, raising=False)
+    assert nogds._use_async_copy() is False
+    monkeypatch.setenv(nogds._COPY_MODE_ENV, "async")
+    assert nogds._use_async_copy() is True
+    monkeypatch.setenv(nogds._COPY_MODE_ENV, "invalid")
+    with pytest.raises(ValueError, match="must be 'sync' or 'async'"):
+        nogds._use_async_copy()
+
+
+def test_nogds_max_threads_env(monkeypatch):
+    from fastsafetensors.copier import nogds
+
+    monkeypatch.delenv(nogds._MAX_THREADS_ENV, raising=False)
+    assert nogds._resolve_max_threads(16) == 16
+    monkeypatch.setenv(nogds._MAX_THREADS_ENV, "8")
+    assert nogds._resolve_max_threads(16) == 8
+
+    for invalid in ("0", "-1", "invalid"):
+        monkeypatch.setenv(nogds._MAX_THREADS_ENV, invalid)
+        with pytest.raises(ValueError, match="must be"):
+            nogds._resolve_max_threads(16)
+
+
+@pytest.mark.parametrize(
+    ("size", "block_size", "request_count"),
+    [
+        (600 * 1024 * 1024, 256 * 1024 * 1024, 3),
+        (8 * 1024**3, 512 * 1024 * 1024, 16),
+    ],
+)
+def test_nogds_splits_large_reads_across_copy_threads(
+    tmp_path, size, block_size, request_count
+):
+    from unittest.mock import MagicMock
+
+    from fastsafetensors.copier.nogds import NoGdsFileCopier
+    from fastsafetensors.st_types import Device
+
+    path = tmp_path / "large.safetensors"
+    path.touch()
+    metadata = MagicMock(src=str(path), header_length=0, size_bytes=size)
+    reader = MagicMock()
+    reader.submit_read.side_effect = range(request_count)
+    reader.wait_read.return_value = 1
+    framework = MagicMock()
+    framework.alloc_tensor_memory.return_value = object()
+    copier = NoGdsFileCopier(
+        metadata, Device.from_str("cpu"), reader, framework
+    )
+
+    gbuf = copier.submit_io(False, 16 * 1024 * 1024 * 1024)
+    copier.wait_io(gbuf)
+
+    lengths = [call.args[3] for call in reader.submit_read.call_args_list]
+    assert lengths == [block_size] * (request_count - 1) + [
+        size - block_size * (request_count - 1)
+    ]
+
+
 # ---- chunk plans must fail loudly on copiers without set_chunk ----
 
 
