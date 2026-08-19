@@ -531,11 +531,11 @@ class PipelineParallel:
                 self.consumer_processed.set()
             # Check end signal
             if batch_item is None:
-                self._log_error(f"get batch_item is None, will break")
+                self._log_error("get batch_item is None, will break")
                 return
             # Check for errors
             if isinstance(batch_item, Exception):
-                self._log_error(f"get batch_item is Exception, will raise")
+                self._log_error("get batch_item is Exception, will raise")
                 raise batch_item
             # Process normal batch
             batch = batch_item
@@ -553,11 +553,48 @@ class PipelineParallel:
             with TimingContext(
                 "get_tensor", self._log_message, batch.batch_id
             ) as timer:
+                view_ns = 0
+                clone_ns = 0
+                downstream_ns = 0
+                clone_count = 0
                 for key in batch.keys:
+                    view_begin = time.perf_counter_ns()
                     tensor = batch.fb.get_tensor(key)
+                    view_elapsed_ns = time.perf_counter_ns() - view_begin
+                    view_ns += view_elapsed_ns
                     if self.need_clone:
+                        clone_begin = time.perf_counter_ns()
                         tensor = tensor.clone()
+                        clone_elapsed_ns = time.perf_counter_ns() - clone_begin
+                        clone_ns += clone_elapsed_ns
+                        clone_count += 1
+                        if clone_elapsed_ns >= 10_000_000:
+                            self._log_message(
+                                f"Batch {batch.batch_id}: slow clone: "
+                                f"key={key}, elapsed={clone_elapsed_ns / 1e6:.3f} ms"
+                            )
+                    if view_elapsed_ns >= 10_000_000:
+                        self._log_message(
+                            f"Batch {batch.batch_id}: slow tensor view: "
+                            f"key={key}, elapsed={view_elapsed_ns / 1e6:.3f} ms"
+                        )
+                    downstream_begin = time.perf_counter_ns()
                     yield key, tensor
+                    downstream_elapsed_ns = time.perf_counter_ns() - downstream_begin
+                    downstream_ns += downstream_elapsed_ns
+                    if downstream_elapsed_ns >= 10_000_000:
+                        self._log_message(
+                            f"Batch {batch.batch_id}: slow downstream: "
+                            f"key={key}, "
+                            f"elapsed={downstream_elapsed_ns / 1e6:.3f} ms"
+                        )
+                self._log_message(
+                    f"Batch {batch.batch_id}: get_tensor breakdown: "
+                    f"views={view_ns / 1e6:.3f} ms, "
+                    f"clones={clone_ns / 1e6:.3f} ms, "
+                    f"downstream={downstream_ns / 1e6:.3f} ms, "
+                    f"keys={len(batch.keys)}, clones_count={clone_count}"
+                )
             get_tensor_time = timer.elapsed_ms
         finally:
             # Close the file buffer
@@ -601,7 +638,7 @@ class PipelineParallel:
                 f"processed {processed_batches} batches, total time: {elapsed_time:.2f} seconds"
             )
         if processed_batches < len(self.weight_files_batches):
-            self._log_error(f"Unexpected Error: not all tensors has been exported")
+            self._log_error("Unexpected Error: not all tensors has been exported")
 
     def iterate_weights(self) -> Generator[Tuple[str, Any], None, None]:
         """Main weight iterator: consumer logic.
@@ -741,6 +778,9 @@ class ParallelLoader(PipelineParallel):
             debug_log (bool): Enable debug logs.
             framework (str): Framework to use for tensor operations.
         """
+        debug_log = debug_log or os.getenv(
+            "FASTSAFETENSORS_DEBUG", "false"
+        ).lower() == ("true")
         # all_local: load with a single-process group so each rank reads its
         # files independently (no cross-rank broadcast in get_tensor). This is
         # what makes a per-rank tensor_filter correct -- otherwise get_tensor

@@ -7,6 +7,7 @@ except ImportError as e:
     raise ImportError("could not import torch. Please install it.") from e
 
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -242,8 +243,29 @@ class TorchOp(FrameworkOpBase[TorchTensor, TorchProcessGroup]):
             torch.cuda.set_device(device.as_str())
 
     def alloc_tensor_memory(self, length: int, dev: Device) -> gds_device_buffer:
+        debug_log = os.getenv("FASTSAFETENSORS_DEBUG", "false").lower() == "true"
         if dev.type == DeviceType.CUDA:
+            stats_before = torch.cuda.memory_stats(dev.as_str()) if debug_log else None
+            alloc_begin = time.perf_counter_ns()
             rbuf = torch.cuda.caching_allocator_alloc(length)
+            alloc_us = (time.perf_counter_ns() - alloc_begin) // 1000
+            if stats_before is not None:
+                stats_after = torch.cuda.memory_stats(dev.as_str())
+                print(
+                    "[DEBUG] TorchOp.alloc_tensor_memory: "
+                    f"requested_bytes={length}, elapsed={alloc_us} us, "
+                    "allocated_bytes_delta="
+                    f"{stats_after.get('allocated_bytes.all.current', 0) - stats_before.get('allocated_bytes.all.current', 0)}, "
+                    "reserved_bytes_delta="
+                    f"{stats_after.get('reserved_bytes.all.current', 0) - stats_before.get('reserved_bytes.all.current', 0)}, "
+                    "segments_delta="
+                    f"{stats_after.get('segment.all.current', 0) - stats_before.get('segment.all.current', 0)}, "
+                    "alloc_retries_delta="
+                    f"{stats_after.get('num_alloc_retries', 0) - stats_before.get('num_alloc_retries', 0)}, "
+                    "ooms_delta="
+                    f"{stats_after.get('num_ooms', 0) - stats_before.get('num_ooms', 0)}",
+                    flush=True,
+                )
         else:
             rbuf = cpu_malloc(length)
         self.mem_used += length
