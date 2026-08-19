@@ -142,12 +142,12 @@ class PipelineParallel:
         use_tqdm_on_load: bool = True,
         tensor_filter: Optional[Callable[[str], bool]] = None,
         max_batch_bytes: Optional[int] = None,
+        fixed_batch_buffer: bool = False,
         device_memory_budget: Optional[int] = None,
         accumulate_resident: bool = True,
         borrowed_tensors: bool = False,
         **kwargs,
     ):
-
         if max_concurrent_producers != 1:
             raise ValueError(
                 f"max_concurrent_producers must be 1 (got {max_concurrent_producers}). "
@@ -178,6 +178,16 @@ class PipelineParallel:
         # bytes) so peak device buffer per rank is bounded regardless of shard
         # size. See _planner.plan_chunks / CopierInterface.set_chunk.
         self.max_batch_bytes = max_batch_bytes
+        # Allocate each compact chunk at its planner budget instead of its
+        # exact span. Repeated chunks then request identical caching-allocator
+        # blocks while the planner's existing peak bound remains unchanged.
+        if fixed_batch_buffer and (
+            max_batch_bytes is None and device_memory_budget is None
+        ):
+            raise ValueError(
+                "fixed_batch_buffer requires max_batch_bytes or device_memory_budget"
+            )
+        self.fixed_batch_buffer = fixed_batch_buffer
         # When set (bytes), bound the load's TOTAL device footprint (resident
         # tensors + transient buffers) via a static fit plan: whole-file loads
         # while headroom is ample, per-file chunk budgets declining as the
@@ -312,28 +322,36 @@ class PipelineParallel:
         # lockstep. Header reads are deterministic, so all ranks build identical
         # batches. Each shard stays owned by one rank and is loaded in chunks
         # over successive batches -> peak buffer bounded by its budget per rank.
-        def _plan_file(f: str) -> List[Tuple[Set[str], List[Tuple[int, int]]]]:
+        def _plan_file(
+            f: str,
+        ) -> Tuple[List[Tuple[Set[str], List[Tuple[int, int]]]], int]:
             if per_file_budget is not None:
-                return plan_chunks(
-                    meta_by_path[f], per_file_budget[f], keep_tensor=keep
+                budget = per_file_budget[f]
+                return (
+                    plan_chunks(meta_by_path[f], budget, keep_tensor=keep),
+                    budget,
                 )
             assert self.max_batch_bytes is not None
-            return plan_chunks(
-                SafeTensorsMetadata.from_file(f, fw),
+            return (
+                plan_chunks(
+                    SafeTensorsMetadata.from_file(f, fw),
+                    self.max_batch_bytes,
+                    keep_tensor=keep,
+                ),
                 self.max_batch_bytes,
-                keep_tensor=keep,
             )
 
         chunk_batches: List[List[Any]] = []
         for group in file_batches:
-            planned = [(f, _plan_file(f)) for f in group]
-            maxn = max((len(chunks) for _, chunks in planned), default=0)
+            planned = [(f, *_plan_file(f)) for f in group]
+            maxn = max((len(chunks) for _, chunks, _ in planned), default=0)
             for j in range(maxn):
                 spec: List[Any] = []
-                for f, chunks in planned:
+                for f, chunks, budget in planned:
                     if j < len(chunks):
                         names, ranges = chunks[j]
-                        spec.append((f, names, ranges))
+                        allocation_size = budget if self.fixed_batch_buffer else None
+                        spec.append((f, names, ranges, allocation_size))
                     else:
                         spec.append(None)
                 chunk_batches.append(spec)
@@ -401,13 +419,15 @@ class PipelineParallel:
         if self.max_batch_bytes is None and self.device_memory_budget is None:
             return {i: [f] for i, f in enumerate(spec)}, None
         rank_file_map: Dict[int, List[str]] = {}
-        chunk_plan: Dict[str, Tuple[Set[str], List[Tuple[int, int]]]] = {}
+        chunk_plan: Dict[
+            str, Tuple[Set[str], List[Tuple[int, int]], Optional[int]]
+        ] = {}
         for r, entry in enumerate(spec):
             if entry is None:
                 continue
-            f, names, ranges = entry
+            f, names, ranges, allocation_size = entry
             rank_file_map[r] = [f]
-            chunk_plan[f] = (names, ranges)
+            chunk_plan[f] = (names, ranges, allocation_size)
         return rank_file_map, chunk_plan
 
     def _load_single_batch(self, batch_id: int, file_list: List[Any]):
@@ -666,6 +686,10 @@ class ParallelLoader(PipelineParallel):
                          caller must copy each tensor before advancing the
                          iterator. Requires accumulate_resident=False and a
                          single-process loader. Defaults to False.
+        fixed_batch_buffer (bool): If True, allocate each compact chunk at its
+                         planner budget rather than its exact byte span. This
+                         improves caching-allocator reuse. Requires
+                         max_batch_bytes or device_memory_budget.
 
     Additional GPU memory consumption: (max_concurrent_producers + queue_size) * file_size
     To reduce GPU memory consumption, re-accessing tensors that have already been accessed is prohibited.
@@ -695,6 +719,7 @@ class ParallelLoader(PipelineParallel):
         tensor_filter: Optional[Callable[[str], bool]] = None,
         all_local: bool = False,
         max_batch_bytes: Optional[int] = None,
+        fixed_batch_buffer: bool = False,
         device_memory_budget: Optional[int] = None,
         accumulate_resident: bool = True,
         borrowed_tensors: bool = False,
@@ -742,6 +767,7 @@ class ParallelLoader(PipelineParallel):
             use_tqdm_on_load,
             tensor_filter=tensor_filter,
             max_batch_bytes=max_batch_bytes,
+            fixed_batch_buffer=fixed_batch_buffer,
             device_memory_budget=device_memory_budget,
             accumulate_resident=accumulate_resident,
             borrowed_tensors=borrowed_tensors,

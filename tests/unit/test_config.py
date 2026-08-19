@@ -365,6 +365,7 @@ class TestLoaderConfigKwargsHelpers:
             "queue_size": 2,
             "use_tqdm_on_load": False,
             "max_batch_bytes": None,
+            "fixed_batch_buffer": False,
             "device_memory_budget": None,
         }
 
@@ -379,6 +380,7 @@ class TestLoaderConfigKwargsHelpers:
         assert kwargs == {
             "queue_size": -1,
             "max_batch_bytes": None,
+            "fixed_batch_buffer": False,
             "device_memory_budget": None,
         }
 

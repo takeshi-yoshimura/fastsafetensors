@@ -38,6 +38,10 @@ class LoaderConfig:
     # Must be >= the largest single tensor. See _planner.plan_chunks.
     max_batch_bytes: Optional[int] = None
 
+    # Allocate every compact chunk buffer at its planner budget instead of its
+    # exact byte span, producing stable allocation sizes for cache reuse.
+    fixed_batch_buffer: bool = False
+
     # Bound the load's total device footprint in bytes (resident tensors +
     # transient buffers) per rank via a static fit plan: whole-file loads while
     # headroom is ample, chunking only where the fit requires it. The caller
@@ -119,6 +123,7 @@ class LoaderConfig:
         # Memory knobs apply with or without pipelining.
         common: Dict[str, Any] = {
             "max_batch_bytes": self.max_batch_bytes,
+            "fixed_batch_buffer": self.fixed_batch_buffer,
             "device_memory_budget": self.device_memory_budget,
         }
         if not self.use_pipeline:
