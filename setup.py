@@ -1,10 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import importlib.util
 import os
 import platform
+from pathlib import Path
 
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
+
+_build_support_spec = importlib.util.spec_from_file_location(
+    "fastsafetensors_build_support",
+    Path(__file__).parent / "fastsafetensors" / "build_support.py",
+)
+if _build_support_spec is None or _build_support_spec.loader is None:
+    raise RuntimeError("cannot load fastsafetensors build support")
+_build_support = importlib.util.module_from_spec(_build_support_spec)
+_build_support_spec.loader.exec_module(_build_support)
+compiler_accepts = _build_support.compiler_accepts
+wants_gb10_target = _build_support.wants_gb10_target
+
+
+class FastSafeTensorsBuildExt(build_ext):
+    """Apply GB10 tuning only after compiler initialization."""
+
+    def build_extensions(self):
+        if wants_gb10_target():
+            flag = "-mcpu=gb10"
+            if compiler_accepts(self.compiler, flag):
+                for extension in self.extensions:
+                    extension.extra_compile_args.append(flag)
+                self.announce(f"enabling supported compiler flag {flag}", 2)
+            else:
+                self.announce(f"unsupported {flag}; using portable flags", 2)
+        super().build_extensions()
 
 
 def MyExtension(name, sources, mod_name, *args, **kwargs):
@@ -43,6 +71,7 @@ def MyExtension(name, sources, mod_name, *args, **kwargs):
 package_data_patterns = ["*.hpp", "*.h", "cpp.pyi"]
 
 setup(
+    cmdclass={"build_ext": FastSafeTensorsBuildExt},
     packages=[
         "fastsafetensors",
         "fastsafetensors.copier",

@@ -4,6 +4,21 @@
 import pytest
 
 from fastsafetensors.common import get_fs_type
+from fastsafetensors.parallel_loader import _max_batch_bytes_from_env
+
+
+def test_max_batch_bytes_environment(monkeypatch):
+    monkeypatch.delenv("FASTSAFETENSORS_MAX_BATCH_MB", raising=False)
+    assert _max_batch_bytes_from_env(None) is None
+
+    monkeypatch.setenv("FASTSAFETENSORS_MAX_BATCH_MB", "1024")
+    assert _max_batch_bytes_from_env(None) == 1024 * 1024 * 1024
+    assert _max_batch_bytes_from_env(123) == 123
+
+    monkeypatch.setenv("FASTSAFETENSORS_MAX_BATCH_MB", "-1")
+    with pytest.raises(ValueError, match="must be >= 0"):
+        _max_batch_bytes_from_env(None)
+
 
 # ---- get_fs_type: longest-prefix mount matching ----
 
@@ -183,9 +198,7 @@ def test_nogds_splits_large_reads_across_copy_threads(
     reader.wait_read.return_value = 1
     framework = MagicMock()
     framework.alloc_tensor_memory.return_value = object()
-    copier = NoGdsFileCopier(
-        metadata, Device.from_str("cpu"), reader, framework
-    )
+    copier = NoGdsFileCopier(metadata, Device.from_str("cpu"), reader, framework)
 
     gbuf = copier.submit_io(False, 16 * 1024 * 1024 * 1024)
     copier.wait_io(gbuf)
@@ -332,6 +345,24 @@ def test_fixed_batch_buffer_requires_chunking(input_files, framework):
             [input_files[0]],
             fixed_batch_buffer=True,
         )
+
+
+def test_fixed_batch_buffer_accepts_environment_chunking(
+    input_files, framework, monkeypatch
+):
+    if framework.get_name() != "pytorch":
+        pytest.skip("pytorch-only")
+    from fastsafetensors.parallel_loader import PipelineParallel
+
+    monkeypatch.setenv("FASTSAFETENSORS_MAX_BATCH_MB", "1")
+    pp = PipelineParallel(
+        None,
+        _make_loader(framework),
+        [input_files[0]],
+        fixed_batch_buffer=True,
+    )
+
+    assert pp.max_batch_bytes == 1024 * 1024
 
 
 # ---- runtime GDS -> nogds fallback ----

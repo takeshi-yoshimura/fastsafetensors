@@ -13,6 +13,8 @@ module never imports torch or paddle directly.
 """
 
 import os
+import sys
+import time
 from typing import Dict, List, Optional, Set, Tuple
 
 from .. import cpp as fstcpp
@@ -49,6 +51,23 @@ _NETWORK_FS = {
     "virtiofs",
 }
 _warned_fs: set = set()
+
+
+def _allocation_length(required: int) -> int:
+    """Round transient buffers so PyTorch's allocator can reuse them.
+
+    Safetensors shards commonly differ by a few hundred MiB. Allocating their
+    exact lengths leaves differently-sized blocks in the CUDA caching allocator
+    and repeatedly grows its pool. An opt-in granularity makes consecutive
+    buffers interchangeable without changing tensor offsets or bytes read.
+    """
+    granularity_mb = int(os.environ.get("FASTSAFETENSORS_ALLOC_GRANULARITY_MB", "0"))
+    if granularity_mb < 0:
+        raise ValueError("FASTSAFETENSORS_ALLOC_GRANULARITY_MB must be >= 0")
+    if granularity_mb == 0 or required == 0:
+        return required
+    granularity = granularity_mb * 1024 * 1024
+    return ((required + granularity - 1) // granularity) * granularity
 
 
 def _odirect_ok(path: str) -> bool:
@@ -169,7 +188,11 @@ class UnifiedMemCopier(CopierInterface):
         self._base_off = base_off
 
         # Allocate CUDA buffer via framework's allocator (proper lifecycle)
-        gbuf = self.framework.alloc_tensor_memory(alloc_length, self.device)
+        profile = os.environ.get("FASTSAFETENSORS_PROFILE") == "1"
+        submit_begin = time.perf_counter() if profile else 0.0
+        buffer_length = _allocation_length(alloc_length)
+        gbuf = self.framework.alloc_tensor_memory(buffer_length, self.device)
+        alloc_done = time.perf_counter() if profile else 0.0
 
         # Fast path: multithreaded O_DIRECT reader copies only the runs straight
         # into gbuf (byte F -> gbuf[F - base_off]), bypassing the page cache and
@@ -201,6 +224,17 @@ class UnifiedMemCopier(CopierInterface):
                 device_id,
             )
             if rc == 0:
+                if profile:
+                    submit_done = time.perf_counter()
+                    print(
+                        f"[FST_PROFILE] submit path=dma file={self.metadata.src} "
+                        f"bytes={alloc_length} capacity={buffer_length} "
+                        f"alloc_ms={(alloc_done - submit_begin) * 1000:.3f} "
+                        f"dma_ms={(submit_done - alloc_done) * 1000:.3f} "
+                        f"total_ms={(submit_done - submit_begin) * 1000:.3f}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 return gbuf
             # Non-zero: reader unusable here; fall back to mmap + pin_memory.
 
@@ -234,15 +268,33 @@ class UnifiedMemCopier(CopierInterface):
         dtype: DType = DType.AUTO,
         noalign: bool = False,
     ) -> Dict[str, TensorBase]:
+        profile = os.environ.get("FASTSAFETENSORS_PROFILE") == "1"
+        wait_begin = time.perf_counter() if profile else 0.0
         self.framework.synchronize(self.device)
+        sync_done = time.perf_counter() if profile else 0.0
 
         # Alignment note: unlike the GDS copier, we only copy the data section
         # (not the header) into gbuf, so gbuf starts at a CUDA-allocator-aligned
         # address. The copy_start_offset=header_length cancels out in get_tensors'
         # pointer arithmetic, giving correct offsets. No memmove fixup needed.
         tensors = self.metadata._get_tensors(
-            gbuf, self.device, self._base_off, dtype=dtype, names=self._chunk_names
+            gbuf,
+            self.device,
+            self._base_off,
+            dtype=dtype,
+            names=self._chunk_names,
         )
+
+        if profile:
+            tensors_done = time.perf_counter()
+            print(
+                f"[FST_PROFILE] materialize file={self.metadata.src} "
+                f"tensors={len(tensors)} sync_ms={(sync_done - wait_begin) * 1000:.3f} "
+                f"dlpack_ms={(tensors_done - sync_done) * 1000:.3f} "
+                f"total_ms={(tensors_done - wait_begin) * 1000:.3f}",
+                file=sys.stderr,
+                flush=True,
+            )
 
         # Release the pinned mmap pages
         self._pinned = []
