@@ -570,9 +570,17 @@ class PipelineParallel:
                 clone_ns = 0
                 downstream_ns = 0
                 clone_count = 0
-                for key in batch.keys:
+                if self.borrowed_tensors:
+                    tensors = batch.fb.iter_local_tensors(batch.keys)
+                else:
+                    tensors = ((key, None) for key in batch.keys)
+                for key, local_tensor in tensors:
                     view_begin = time.perf_counter_ns()
-                    tensor = batch.fb.get_tensor(key)
+                    tensor = (
+                        local_tensor
+                        if local_tensor is not None
+                        else batch.fb.get_tensor(key)
+                    )
                     view_elapsed_ns = time.perf_counter_ns() - view_begin
                     view_ns += view_elapsed_ns
                     if self.need_clone:

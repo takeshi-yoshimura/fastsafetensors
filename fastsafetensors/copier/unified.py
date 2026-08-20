@@ -110,6 +110,7 @@ class UnifiedMemCopier(CopierInterface):
         self._chunk_names: Optional[Set[str]] = None
         self._chunk_allocation_size: Optional[int] = None
         self._base_off = metadata.header_length
+        self._submit_path = "unknown"
         # Worker count for the C++ O_DIRECT range reader (dma_load_runs). Single
         # -thread pin_memory is page-cache-bound (~2.5 GB/s); O_DIRECT threads
         # bypass the cache and drive NVMe queue depth. Falls back to pin_memory
@@ -200,6 +201,7 @@ class UnifiedMemCopier(CopierInterface):
         # FASTSAFETENSORS_DMA_THREADS=0 disables it (falls back to mmap + pin);
         # network filesystems fall back automatically (see _odirect_ok).
         dma_load_runs = getattr(fstcpp, "dma_load_runs", None)
+        dma_attempt_ms = 0.0
         if (
             dma_load_runs is not None
             and self._dma_threads > 0
@@ -223,7 +225,10 @@ class UnifiedMemCopier(CopierInterface):
                 self._dma_threads,
                 device_id,
             )
+            if profile:
+                dma_attempt_ms = (time.perf_counter() - alloc_done) * 1000
             if rc == 0:
+                self._submit_path = "dma"
                 if profile:
                     submit_done = time.perf_counter()
                     print(
@@ -237,28 +242,54 @@ class UnifiedMemCopier(CopierInterface):
                     )
                 return gbuf
             # Non-zero: reader unusable here; fall back to mmap + pin_memory.
+            if profile:
+                print(
+                    f"[FST_PROFILE] dma_fallback file={self.metadata.src} "
+                    f"rc={rc} dma_attempt_ms={dma_attempt_ms:.3f}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
         base_address = gbuf.get_base_address()
         self._pinned = []
+        self._submit_path = "mmap"
+        pin_ms = 0.0
+        copy_submit_ms = 0.0
+        copied_bytes = 0
         for start, end in runs:
-            # mmap_file_pinned faults in + pins only this run's pages
-            # (kernel readahead + DMA-ready), then DMA to the matching offset in
-            # gbuf (gbuf[0] maps to file offset base_off).
+            # mmap_file_pinned faults in + pins only this run's pages.
+            stage_begin = time.perf_counter() if profile else 0.0
             pinned = self.framework.mmap_file_pinned(
                 self.metadata.src, end - start, start
             )
+            if profile:
+                pin_ms += (time.perf_counter() - stage_begin) * 1000
             self._pinned.append(pinned)
+            stage_begin = time.perf_counter() if profile else 0.0
             ret = fstcpp.memcpy_h2d_async(  # type: ignore[attr-defined]
-                base_address + (start - base_off),
-                pinned.data_ptr(),
-                end - start,
+                base_address + (start - base_off), pinned.data_ptr(), end - start
             )
+            if profile:
+                copy_submit_ms += (time.perf_counter() - stage_begin) * 1000
+                copied_bytes += end - start
             if ret != 0:
                 self.framework.free_tensor_memory(gbuf, self.device)
                 self._pinned = []
                 raise RuntimeError(
                     f"cudaMemcpyAsync failed with error {ret} for {self.metadata.src}"
                 )
+
+        if profile:
+            submit_done = time.perf_counter()
+            print(
+                f"[FST_PROFILE] submit path=mmap file={self.metadata.src} "
+                f"runs={len(runs)} bytes={copied_bytes} capacity={buffer_length} "
+                f"alloc_ms={(alloc_done - submit_begin) * 1000:.3f} "
+                f"dma_attempt_ms={dma_attempt_ms:.3f} pin_ms={pin_ms:.3f} "
+                f"copy_submit_ms={copy_submit_ms:.3f} "
+                f"total_ms={(submit_done - submit_begin) * 1000:.3f}",
+                file=sys.stderr, flush=True,
+            )
 
         return gbuf
 
@@ -285,19 +316,21 @@ class UnifiedMemCopier(CopierInterface):
             names=self._chunk_names,
         )
 
-        if profile:
-            tensors_done = time.perf_counter()
-            print(
-                f"[FST_PROFILE] materialize file={self.metadata.src} "
-                f"tensors={len(tensors)} sync_ms={(sync_done - wait_begin) * 1000:.3f} "
-                f"dlpack_ms={(tensors_done - sync_done) * 1000:.3f} "
-                f"total_ms={(tensors_done - wait_begin) * 1000:.3f}",
-                file=sys.stderr,
-                flush=True,
-            )
-
-        # Release the pinned mmap pages
+        # Release pinned mmap pages and time unpin separately.
+        tensors_done = time.perf_counter() if profile else 0.0
+        pinned_runs = len(self._pinned)
         self._pinned = []
+        if profile:
+            release_done = time.perf_counter()
+            print(
+                f"[FST_PROFILE] materialize path={self._submit_path} "
+                f"file={self.metadata.src} tensors={len(tensors)} pinned_runs={pinned_runs} "
+                f"sync_ms={(sync_done - wait_begin) * 1000:.3f} "
+                f"dlpack_ms={(tensors_done - sync_done) * 1000:.3f} "
+                f"release_ms={(release_done - tensors_done) * 1000:.3f} "
+                f"total_ms={(release_done - wait_begin) * 1000:.3f}",
+                file=sys.stderr, flush=True,
+            )
 
         return tensors
 

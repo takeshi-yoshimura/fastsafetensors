@@ -172,6 +172,20 @@ class FilesBufferOnDevice:
         """
         return self.get_tensor_wrapped(tensor_name, device, dtype).get_raw()
 
+    def iter_local_tensors(self, tensor_names: List[str]):
+        """Yield already-materialized tensors without the distributed path.
+
+        This is only valid for a single-process buffer. The returned tensors
+        borrow their backing device buffers and become invalid after close().
+        """
+        if self.pg.size() != 1:
+            raise RuntimeError("iter_local_tensors requires a single-process group")
+        for tensor_name in tensor_names:
+            rank, lidx = self._get_rank_lidx(tensor_name)
+            yield tensor_name, self.rank_loaders[rank][lidx].tensors[
+                tensor_name
+            ].get_raw()
+
     def push_tensor(
         self,
         tensor_name: str,

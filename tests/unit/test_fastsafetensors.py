@@ -398,7 +398,7 @@ def _skip_if_not_pytorch(framework: FrameworkOpBase) -> None:
         )
 
 
-def test_UnifiedMemCopier(fstcpp_log, input_files, framework, monkeypatch) -> None:
+def test_UnifiedMemCopier(fstcpp_log, input_files, framework, monkeypatch, capsys) -> None:
     print("test_UnifiedMemCopier")
     _skip_if_not_pytorch(framework)
     import ctypes
@@ -422,6 +422,7 @@ def test_UnifiedMemCopier(fstcpp_log, input_files, framework, monkeypatch) -> No
     # This test exercises the mmap + pin_memory flow; disable the O_DIRECT
     # fast path so the monkeypatched primitives are actually used.
     monkeypatch.setenv("FASTSAFETENSORS_DMA_THREADS", "0")
+    monkeypatch.setenv("FASTSAFETENSORS_PROFILE", "1")
     copier = UnifiedMemCopier(meta, device, framework)
     gbuf = copier.submit_io(False, 10 * 1024 * 1024 * 1024)
     tensors = copier.wait_io(gbuf)
@@ -430,6 +431,12 @@ def test_UnifiedMemCopier(fstcpp_log, input_files, framework, monkeypatch) -> No
         assert framework.is_equal(actual, exp)
     # Lifecycle: pinned mmap references released in wait_io
     assert copier._pinned == []
+    profile = capsys.readouterr().err
+    assert "[FST_PROFILE] submit path=mmap" in profile
+    assert "pin_ms=" in profile
+    assert "copy_submit_ms=" in profile
+    assert "[FST_PROFILE] materialize path=mmap" in profile
+    assert "release_ms=" in profile
     framework.free_tensor_memory(gbuf, device)
     assert framework.get_mem_used() == 0
     assert fstcpp.get_cpp_metrics().bounce_buffer_bytes == 0

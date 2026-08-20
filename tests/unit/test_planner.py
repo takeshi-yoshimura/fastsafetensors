@@ -483,6 +483,44 @@ def test_single_process_loader_budgets_yield_clone(
     assert captured["extra_transient_buffers"] == expected_extra_buffers
 
 
+def test_borrowed_tensors_bypass_generic_get_tensor(
+    input_files, framework, monkeypatch
+):
+    if framework.get_name() != "pytorch":
+        pytest.skip("pytorch-only integration test")
+
+    import torch
+    from safetensors.torch import load_file
+
+    from fastsafetensors import ParallelLoader
+    from fastsafetensors.file_buffer import FilesBufferOnDevice
+
+    def fail_get_tensor(*args, **kwargs):
+        raise AssertionError("borrowed local tensors must bypass get_tensor")
+
+    monkeypatch.setattr(FilesBufferOnDevice, "get_tensor", fail_get_tensor)
+    expected = load_file(input_files[0])
+    pl = ParallelLoader(
+        pg=None,
+        hf_weights_files=[input_files[0]],
+        device="cpu",
+        nogds=True,
+        use_tqdm_on_load=False,
+        accumulate_resident=False,
+        borrowed_tensors=True,
+    )
+    try:
+        got = {}
+        for name, tensor in pl.iterate_weights():
+            got[name] = tensor.clone()
+    finally:
+        pl.close()
+
+    assert set(got) == set(expected)
+    for name in expected:
+        assert torch.equal(got[name], expected[name]), name
+
+
 def test_transient_multiplier_infeasible():
     # a plan feasible at 1x must fail at 2x when the budget is tight
     stats = [_st("f0", 2 * GiB)]
