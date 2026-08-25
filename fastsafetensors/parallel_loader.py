@@ -566,56 +566,78 @@ class PipelineParallel:
             with TimingContext(
                 "get_tensor", self._log_message, batch.batch_id
             ) as timer:
-                view_ns = 0
-                clone_ns = 0
-                downstream_ns = 0
-                clone_count = 0
-                if self.borrowed_tensors:
-                    tensors = batch.fb.iter_local_tensors(batch.keys)
+                if not self.print_log:
+                    # Per-tensor diagnostics are surprisingly expensive for
+                    # MoE checkpoints with hundreds of thousands of entries.
+                    # Keep the normal path free of clock reads and threshold
+                    # checks; the detailed breakdown remains available when
+                    # debug logging is explicitly enabled.
+                    if self.borrowed_tensors:
+                        tensors = batch.fb.iter_local_tensors(batch.keys)
+                    else:
+                        tensors = ((key, None) for key in batch.keys)
+                    for key, local_tensor in tensors:
+                        tensor = (
+                            local_tensor
+                            if local_tensor is not None
+                            else batch.fb.get_tensor(key)
+                        )
+                        if self.need_clone:
+                            tensor = tensor.clone()
+                        yield key, tensor
                 else:
-                    tensors = ((key, None) for key in batch.keys)
-                for key, local_tensor in tensors:
-                    view_begin = time.perf_counter_ns()
-                    tensor = (
-                        local_tensor
-                        if local_tensor is not None
-                        else batch.fb.get_tensor(key)
-                    )
-                    view_elapsed_ns = time.perf_counter_ns() - view_begin
-                    view_ns += view_elapsed_ns
-                    if self.need_clone:
-                        clone_begin = time.perf_counter_ns()
-                        tensor = tensor.clone()
-                        clone_elapsed_ns = time.perf_counter_ns() - clone_begin
-                        clone_ns += clone_elapsed_ns
-                        clone_count += 1
-                        if clone_elapsed_ns >= 10_000_000:
+                    view_ns = 0
+                    clone_ns = 0
+                    downstream_ns = 0
+                    clone_count = 0
+                    if self.borrowed_tensors:
+                        tensors = batch.fb.iter_local_tensors(batch.keys)
+                    else:
+                        tensors = ((key, None) for key in batch.keys)
+                    for key, local_tensor in tensors:
+                        view_begin = time.perf_counter_ns()
+                        tensor = (
+                            local_tensor
+                            if local_tensor is not None
+                            else batch.fb.get_tensor(key)
+                        )
+                        view_elapsed_ns = time.perf_counter_ns() - view_begin
+                        view_ns += view_elapsed_ns
+                        if self.need_clone:
+                            clone_begin = time.perf_counter_ns()
+                            tensor = tensor.clone()
+                            clone_elapsed_ns = time.perf_counter_ns() - clone_begin
+                            clone_ns += clone_elapsed_ns
+                            clone_count += 1
+                            if clone_elapsed_ns >= 10_000_000:
+                                self._log_message(
+                                    f"Batch {batch.batch_id}: slow clone: "
+                                    f"key={key}, elapsed={clone_elapsed_ns / 1e6:.3f} ms"
+                                )
+                        if view_elapsed_ns >= 10_000_000:
                             self._log_message(
-                                f"Batch {batch.batch_id}: slow clone: "
-                                f"key={key}, elapsed={clone_elapsed_ns / 1e6:.3f} ms"
+                                f"Batch {batch.batch_id}: slow tensor view: "
+                                f"key={key}, elapsed={view_elapsed_ns / 1e6:.3f} ms"
                             )
-                    if view_elapsed_ns >= 10_000_000:
-                        self._log_message(
-                            f"Batch {batch.batch_id}: slow tensor view: "
-                            f"key={key}, elapsed={view_elapsed_ns / 1e6:.3f} ms"
+                        downstream_begin = time.perf_counter_ns()
+                        yield key, tensor
+                        downstream_elapsed_ns = (
+                            time.perf_counter_ns() - downstream_begin
                         )
-                    downstream_begin = time.perf_counter_ns()
-                    yield key, tensor
-                    downstream_elapsed_ns = time.perf_counter_ns() - downstream_begin
-                    downstream_ns += downstream_elapsed_ns
-                    if downstream_elapsed_ns >= 10_000_000:
-                        self._log_message(
-                            f"Batch {batch.batch_id}: slow downstream: "
-                            f"key={key}, "
-                            f"elapsed={downstream_elapsed_ns / 1e6:.3f} ms"
-                        )
-                self._log_message(
-                    f"Batch {batch.batch_id}: get_tensor breakdown: "
-                    f"views={view_ns / 1e6:.3f} ms, "
-                    f"clones={clone_ns / 1e6:.3f} ms, "
-                    f"downstream={downstream_ns / 1e6:.3f} ms, "
-                    f"keys={len(batch.keys)}, clones_count={clone_count}"
-                )
+                        downstream_ns += downstream_elapsed_ns
+                        if downstream_elapsed_ns >= 10_000_000:
+                            self._log_message(
+                                f"Batch {batch.batch_id}: slow downstream: "
+                                f"key={key}, "
+                                f"elapsed={downstream_elapsed_ns / 1e6:.3f} ms"
+                            )
+                    self._log_message(
+                        f"Batch {batch.batch_id}: get_tensor breakdown: "
+                        f"views={view_ns / 1e6:.3f} ms, "
+                        f"clones={clone_ns / 1e6:.3f} ms, "
+                        f"downstream={downstream_ns / 1e6:.3f} ms, "
+                        f"keys={len(batch.keys)}, clones_count={clone_count}"
+                    )
             get_tensor_time = timer.elapsed_ms
         finally:
             # Close the file buffer

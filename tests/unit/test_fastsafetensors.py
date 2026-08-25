@@ -442,6 +442,57 @@ def test_UnifiedMemCopier(fstcpp_log, input_files, framework, monkeypatch, capsy
     assert fstcpp.get_cpp_metrics().bounce_buffer_bytes == 0
 
 
+def test_UnifiedMemCopier_overlaps_materialization(
+    fstcpp_log, input_files, framework, monkeypatch
+) -> None:
+    """Tensor views are ready while the O_DIRECT call is still in flight."""
+    print("test_UnifiedMemCopier_overlaps_materialization")
+    _skip_if_not_pytorch(framework)
+    import ctypes
+    import os
+    import threading
+
+    meta = SafeTensorsMetadata.from_file(input_files[0], framework)
+    # Keep the stand-in copy on CPU even when the test host has a GPU; ctypes
+    # cannot write directly to a CUDA virtual address.
+    device = Device.from_str("cpu")
+
+    materialized = threading.Event()
+    get_tensors = meta._get_tensors
+
+    def observed_get_tensors(*args, **kwargs):
+        tensors = get_tensors(*args, **kwargs)
+        materialized.set()
+        return tensors
+
+    monkeypatch.setattr(meta, "_get_tensors", observed_get_tensors)
+
+    def fake_dma(dst, path, base_off, starts, ends, threads, device_id):
+        # This assertion would time out if submit_io waited for DMA before
+        # starting view construction.
+        assert materialized.wait(2)
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            for start, end in zip(starts, ends):
+                data = os.pread(fd, end - start, start)
+                ctypes.memmove(dst + start - base_off, data, len(data))
+        finally:
+            os.close(fd)
+        return 0
+
+    monkeypatch.setattr(fstcpp, "dma_load_runs", fake_dma)
+    monkeypatch.setenv("FASTSAFETENSORS_DMA_THREADS", "1")
+    monkeypatch.setenv("FASTSAFETENSORS_ODIRECT", "1")
+    monkeypatch.setenv("FASTSAFETENSORS_OVERLAP_MATERIALIZE", "1")
+    copier = UnifiedMemCopier(meta, device, framework)
+    gbuf = copier.submit_io(False, 10 * 1024 * 1024 * 1024)
+    tensors = copier.wait_io(gbuf)
+    for key, exp in load_safetensors_file(input_files[0], device, framework).items():
+        assert framework.is_equal(tensors[key], exp)
+    framework.free_tensor_memory(gbuf, device)
+    assert framework.get_mem_used() == 0
+
+
 def test_UnifiedMemCopier_cuda_error(
     fstcpp_log, input_files, framework, monkeypatch
 ) -> None:

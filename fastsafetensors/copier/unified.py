@@ -14,6 +14,7 @@ module never imports torch or paddle directly.
 
 import os
 import sys
+import threading
 import time
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -111,11 +112,64 @@ class UnifiedMemCopier(CopierInterface):
         self._chunk_allocation_size: Optional[int] = None
         self._base_off = metadata.header_length
         self._submit_path = "unknown"
+        self._materialize_thread: Optional[threading.Thread] = None
+        self._materialized: Optional[Dict[str, TensorBase]] = None
+        self._materialize_error: Optional[BaseException] = None
+        self._materialize_ms = 0.0
         # Worker count for the C++ O_DIRECT range reader (dma_load_runs). Single
         # -thread pin_memory is page-cache-bound (~2.5 GB/s); O_DIRECT threads
         # bypass the cache and drive NVMe queue depth. Falls back to pin_memory
         # if the reader is unavailable.
         self._dma_threads = int(os.environ.get("FASTSAFETENSORS_DMA_THREADS", "8"))
+
+    def _start_materialization(self, gbuf: fstcpp.gds_device_buffer) -> None:
+        """Create tensor views while O_DIRECT workers populate ``gbuf``.
+
+        Constructing DLPack/Torch views only records addresses, shapes, and
+        strides; it does not read tensor contents. Consumers cannot observe the
+        views until submit_io has completed and wait_io joins this thread.
+        """
+        if os.environ.get("FASTSAFETENSORS_OVERLAP_MATERIALIZE", "1") != "1":
+            return
+
+        self._materialized = None
+        self._materialize_error = None
+        self._materialize_ms = 0.0
+
+        def materialize() -> None:
+            begin = time.perf_counter()
+            try:
+                self.framework.set_device(self.device)
+                self._materialized = self.metadata._get_tensors(
+                    gbuf,
+                    self.device,
+                    self._base_off,
+                    names=self._chunk_names,
+                )
+            except BaseException as exc:
+                self._materialize_error = exc
+            finally:
+                self._materialize_ms = (time.perf_counter() - begin) * 1000
+
+        self._materialize_thread = threading.Thread(
+            target=materialize,
+            name="fastsafetensors-materialize",
+        )
+        self._materialize_thread.start()
+
+    def _finish_materialization(self) -> Optional[Dict[str, TensorBase]]:
+        thread = self._materialize_thread
+        if thread is None:
+            return None
+        thread.join()
+        self._materialize_thread = None
+        if self._materialize_error is not None:
+            error = self._materialize_error
+            self._materialize_error = None
+            raise error
+        tensors = self._materialized
+        self._materialized = None
+        return tensors
 
     def set_byte_ranges(self, byte_ranges: Optional[List[Tuple[int, int]]]) -> None:
         """Restrict reads to these ``[start, end)`` absolute file-offset runs.
@@ -216,6 +270,7 @@ class UnifiedMemCopier(CopierInterface):
                 device_id = -1
             else:
                 device_id = self.device.index if self.device.index is not None else 0
+            self._start_materialization(gbuf)
             rc = dma_load_runs(
                 gbuf.get_base_address(),
                 self.metadata.src,
@@ -273,7 +328,10 @@ class UnifiedMemCopier(CopierInterface):
                 copy_submit_ms += (time.perf_counter() - stage_begin) * 1000
                 copied_bytes += end - start
             if ret != 0:
-                self.framework.free_tensor_memory(gbuf, self.device)
+                try:
+                    self._finish_materialization()
+                finally:
+                    self.framework.free_tensor_memory(gbuf, self.device)
                 self._pinned = []
                 raise RuntimeError(
                     f"cudaMemcpyAsync failed with error {ret} for {self.metadata.src}"
@@ -308,13 +366,18 @@ class UnifiedMemCopier(CopierInterface):
         # (not the header) into gbuf, so gbuf starts at a CUDA-allocator-aligned
         # address. The copy_start_offset=header_length cancels out in get_tensors'
         # pointer arithmetic, giving correct offsets. No memmove fixup needed.
-        tensors = self.metadata._get_tensors(
-            gbuf,
-            self.device,
-            self._base_off,
-            dtype=dtype,
-            names=self._chunk_names,
-        )
+        tensors = self._finish_materialization() if dtype == DType.AUTO else None
+        if tensors is None:
+            # A speculative AUTO materialization, if any, must finish before a
+            # dtype-converting pass can safely replace it.
+            self._finish_materialization()
+            tensors = self.metadata._get_tensors(
+                gbuf,
+                self.device,
+                self._base_off,
+                dtype=dtype,
+                names=self._chunk_names,
+            )
 
         # Release pinned mmap pages and time unpin separately.
         tensors_done = time.perf_counter() if profile else 0.0
@@ -327,6 +390,7 @@ class UnifiedMemCopier(CopierInterface):
                 f"file={self.metadata.src} tensors={len(tensors)} pinned_runs={pinned_runs} "
                 f"sync_ms={(sync_done - wait_begin) * 1000:.3f} "
                 f"dlpack_ms={(tensors_done - sync_done) * 1000:.3f} "
+                f"dlpack_worker_ms={self._materialize_ms:.3f} "
                 f"release_ms={(release_done - tensors_done) * 1000:.3f} "
                 f"total_ms={(release_done - wait_begin) * 1000:.3f}",
                 file=sys.stderr, flush=True,
