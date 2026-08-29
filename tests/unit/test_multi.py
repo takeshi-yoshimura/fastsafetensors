@@ -4,10 +4,38 @@ import os
 
 import pytest
 
-from fastsafetensors import SafeTensorsFileLoader
+from fastsafetensors import ParallelLoader, SafeTensorsFileLoader
 from fastsafetensors import cpp as fstcpp
 from fastsafetensors.common import is_gpu_found
 from fastsafetensors.st_types import DType
+
+
+def test_parallel_loader_broadcast(input_files, pg, framework):
+    """All ranks consume the same tensor order when inflight I/O is enabled."""
+    if framework.get_name() != "pytorch":
+        pytest.skip("pytorch-only")
+    from safetensors.torch import load_file
+
+    rank = pg.rank()
+    device = f"cuda:{rank}" if is_gpu_found() else "cpu"
+    loader = ParallelLoader(
+        pg,
+        input_files,
+        device=device,
+        nogds=True,
+        framework="pytorch",
+        use_tqdm_on_load=False,
+        max_batch_bytes=256,
+    )
+    try:
+        loaded = dict(loader.iterate_weights())
+    finally:
+        loader.close()
+
+    expected = load_file(input_files[0], device=device)
+    assert loaded.keys() == expected.keys()
+    for name, tensor in loaded.items():
+        assert bool(tensor.equal(expected[name]))
 
 
 def test_shuffle(fstcpp_log, input_files, pg, framework):

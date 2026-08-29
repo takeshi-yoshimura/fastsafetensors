@@ -451,6 +451,42 @@ class _FakePG:
         return 0
 
 
+def test_broadcast_pipeline_requests_inflight_tensor_readiness(
+    input_files, framework, monkeypatch
+):
+    if framework.get_name() != "pytorch":
+        pytest.skip("pytorch-only")
+    from fastsafetensors.parallel_loader import FileBatch, PipelineParallel
+
+    loader = _make_loader(framework)
+    captured = []
+
+    class _FakeBuffer:
+        key_to_rank_lidx = {}
+
+        def close(self):
+            pass
+
+    def copy_files_to_device(*, allow_inflight=False):
+        captured.append(allow_inflight)
+        return _FakeBuffer()
+
+    monkeypatch.setattr(loader, "copy_files_to_device", copy_files_to_device)
+    pp = PipelineParallel(
+        _FakePG(),
+        loader,
+        [input_files[0]],
+        use_tqdm_on_load=False,
+    )
+
+    pp._load_single_batch(0, pp.weight_files_batches[0])
+
+    assert captured == [True]
+    batch = pp.batch_queue.get_nowait()
+    assert isinstance(batch, FileBatch)
+    batch.fb.close()
+
+
 def _make_loader(framework):
     from fastsafetensors import SafeTensorsFileLoader
 

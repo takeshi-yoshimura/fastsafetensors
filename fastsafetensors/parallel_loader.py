@@ -489,9 +489,12 @@ class PipelineParallel:
             with TimingContext(
                 "copy_files_to_device", self._log_message, batch_id
             ) as timer:
-                fb = self.loader.copy_files_to_device(
-                    allow_inflight=self.borrowed_tensors and self.loader.pg.size() == 1
-                )
+                # A capable copier can publish each source tensor once its DMA
+                # range completes. Distributed consumers still enter
+                # get_tensor in the deterministic batch key order, so a
+                # receiver may block in the collective until the source range
+                # is ready without waiting for the rest of the chunk.
+                fb = self.loader.copy_files_to_device(allow_inflight=True)
             copy_time = timer.elapsed_ms
 
             # Get tensor keys
