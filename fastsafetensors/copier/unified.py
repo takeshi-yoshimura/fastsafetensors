@@ -116,6 +116,8 @@ class UnifiedMemCopier(CopierInterface):
         self._materialized: Optional[Dict[str, TensorBase]] = None
         self._materialize_error: Optional[BaseException] = None
         self._materialize_ms = 0.0
+        self._materialize_condition = threading.Condition()
+        self._progressive_materialization = False
         self._tensor_readiness = False
         self._dma_completion = None
         self._ready_blocks = bytearray()
@@ -165,6 +167,12 @@ class UnifiedMemCopier(CopierInterface):
         if thread is not None:
             thread.join()
             self._dma_thread = None
+        materialize_error: Optional[BaseException] = None
+        if self._progressive_materialization:
+            try:
+                self._finish_materialization()
+            except BaseException as exc:
+                materialize_error = exc
         if self._dma_error is not None:
             error = self._dma_error
             self._dma_error = None
@@ -173,6 +181,50 @@ class UnifiedMemCopier(CopierInterface):
             rc = self._dma_rc
             self._dma_rc = 0
             raise RuntimeError(f"dma_load_runs failed with rc={rc}")
+        if materialize_error is not None:
+            raise materialize_error
+
+    def _start_progressive_materialization(
+        self, gbuf: fstcpp.gds_device_buffer
+    ) -> None:
+        """Build views ahead of the consumer and publish them incrementally."""
+        self._materialized = {}
+        self._materialize_error = None
+        self._materialize_ms = 0.0
+        self._progressive_materialization = True
+        names = [
+            name
+            for name in self.metadata.tensors
+            if self._chunk_names is None or name in self._chunk_names
+        ]
+
+        def materialize() -> None:
+            begin = time.perf_counter()
+            try:
+                self.framework.set_device(self.device)
+                for index, name in enumerate(names, 1):
+                    tensor = self.metadata._get_tensor(
+                        name, gbuf, self.device, self._base_off
+                    )
+                    assert self._materialized is not None
+                    self._materialized[name] = tensor
+                    # Amortize condition locking while bounding the delay for a
+                    # consumer that catches the producer mid-batch.
+                    if index % 64 == 0:
+                        with self._materialize_condition:
+                            self._materialize_condition.notify_all()
+            except BaseException as exc:
+                self._materialize_error = exc
+            finally:
+                self._materialize_ms = (time.perf_counter() - begin) * 1000
+                with self._materialize_condition:
+                    self._materialize_condition.notify_all()
+
+        self._materialize_thread = threading.Thread(
+            target=materialize,
+            name="fastsafetensors-view-producer",
+        )
+        self._materialize_thread.start()
 
     def _start_materialization(self, gbuf: fstcpp.gds_device_buffer) -> None:
         """Create tensor views while O_DIRECT workers populate ``gbuf``.
@@ -218,9 +270,12 @@ class UnifiedMemCopier(CopierInterface):
         if self._materialize_error is not None:
             error = self._materialize_error
             self._materialize_error = None
+            self._materialized = None
+            self._progressive_materialization = False
             raise error
         tensors = self._materialized
         self._materialized = None
+        self._progressive_materialization = False
         return tensors
 
     def set_byte_ranges(self, byte_ranges: Optional[List[Tuple[int, int]]]) -> None:
@@ -351,6 +406,7 @@ class UnifiedMemCopier(CopierInterface):
                     name="fastsafetensors-dma",
                 )
                 self._dma_thread.start()
+                self._start_progressive_materialization(gbuf)
                 return gbuf
             self._start_materialization(gbuf)
             rc = dma_load_runs(
@@ -487,6 +543,21 @@ class UnifiedMemCopier(CopierInterface):
     def materialize_tensor(
         self, tensor_name: str, gbuf: fstcpp.gds_device_buffer
     ) -> TensorBase:
+        if self._progressive_materialization:
+            with self._materialize_condition:
+                while (
+                    self._materialized is not None
+                    and tensor_name not in self._materialized
+                    and self._materialize_thread is not None
+                    and self._materialize_thread.is_alive()
+                    and self._materialize_error is None
+                ):
+                    self._materialize_condition.wait()
+            if self._materialize_error is not None:
+                raise self._materialize_error
+            if self._materialized is not None and tensor_name in self._materialized:
+                return self._materialized[tensor_name]
+            raise KeyError(f"tensor view was not materialized: {tensor_name}")
         return self.metadata._get_tensor(
             tensor_name, gbuf, self.device, self._base_off
         )
