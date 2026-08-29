@@ -282,11 +282,17 @@ class PipelineParallel:
         keep = self.loader._tensor_filter
         fw = self.loader.framework
 
+        # Parse each header once for both planning and all later chunk loads.
+        # BaseSafeTensorsFileLoader.reset() deliberately preserves this cache.
+        meta_by_path = {
+            f: SafeTensorsMetadata.from_file(f, fw) for f in self.hf_weights_files
+        }
+        self.loader._set_metadata_cache(meta_by_path)
+
         # Per-file chunk budget. Uniform (max_batch_bytes) by default; with
         # device_memory_budget, a static fit plan chooses declining budgets so
         # resident + transient stays within the budget (see planner module).
         per_file_budget: Optional[Dict[str, int]] = None
-        meta_by_path: Dict[str, SafeTensorsMetadata] = {}
         if self.device_memory_budget is not None:
             from ._planner import (
                 collect_file_stats,
@@ -294,9 +300,7 @@ class PipelineParallel:
                 plan_file_budgets,
             )
 
-            metas = [
-                (f, SafeTensorsMetadata.from_file(f, fw)) for f in self.hf_weights_files
-            ]
+            metas = list(meta_by_path.items())
             # Broadcast mode adds one in-flight receive tensor (<= one chunk
             # budget) on top of the live gbufs; the caller passing the same
             # budget on every rank keeps the plan deterministic across ranks.
@@ -347,7 +351,7 @@ class PipelineParallel:
             assert self.max_batch_bytes is not None
             return (
                 plan_chunks(
-                    SafeTensorsMetadata.from_file(f, fw),
+                    meta_by_path[f],
                     self.max_batch_bytes,
                     keep_tensor=keep,
                 ),

@@ -442,6 +442,40 @@ def test_parallel_loader_device_memory_budget_cpu(input_files, framework):
         assert torch.equal(got[k], expected[k]), k
 
 
+def test_chunked_loader_parses_each_header_once(input_files, framework, monkeypatch):
+    if framework.get_name() != "pytorch":
+        pytest.skip("pytorch-only integration test")
+
+    from fastsafetensors import ParallelLoader
+
+    calls = 0
+    from_file = SafeTensorsMetadata.from_file
+
+    def counted_from_file(cls, filename, fw):
+        nonlocal calls
+        calls += 1
+        return from_file(filename, fw)
+
+    monkeypatch.setattr(
+        SafeTensorsMetadata, "from_file", classmethod(counted_from_file)
+    )
+    loader = ParallelLoader(
+        pg=None,
+        hf_weights_files=[input_files[0]],
+        device="cpu",
+        nogds=True,
+        use_tqdm_on_load=False,
+        max_batch_bytes=256,
+    )
+    try:
+        assert len(loader.weight_files_batches) > 1
+        dict(loader.iterate_weights())
+    finally:
+        loader.close()
+
+    assert calls == 1
+
+
 @pytest.mark.parametrize(
     ("accumulate_resident", "borrowed_tensors", "expected_extra_buffers"),
     [(True, False, 0), (False, False, 1), (False, True, 0)],
