@@ -116,11 +116,63 @@ class UnifiedMemCopier(CopierInterface):
         self._materialized: Optional[Dict[str, TensorBase]] = None
         self._materialize_error: Optional[BaseException] = None
         self._materialize_ms = 0.0
+        self._tensor_readiness = False
+        self._dma_completion = None
+        self._ready_blocks = bytearray()
+        self._dma_thread: Optional[threading.Thread] = None
+        self._dma_error: Optional[BaseException] = None
+        self._dma_rc = 0
         # Worker count for the C++ O_DIRECT range reader (dma_load_runs). Single
         # -thread pin_memory is page-cache-bound (~2.5 GB/s); O_DIRECT threads
         # bypass the cache and drive NVMe queue depth. Falls back to pin_memory
         # if the reader is unavailable.
         self._dma_threads = int(os.environ.get("FASTSAFETENSORS_DMA_THREADS", "8"))
+
+    def enable_tensor_readiness(self) -> bool:
+        """Allow tensor views to be consumed while O_DIRECT remains in flight."""
+        supported = all(
+            getattr(fstcpp, name, None) is not None
+            for name in ("dma_completion", "dma_load_runs_progress")
+        )
+        self._tensor_readiness = supported
+        return supported
+
+    def wait_tensor(self, tensor_name: str) -> None:
+        completion = self._dma_completion
+        if completion is None:
+            return
+        frame = self.metadata.tensors[tensor_name]
+        start = self.metadata.header_length + frame.data_offsets[0]
+        end = self.metadata.header_length + frame.data_offsets[1]
+        if end <= start:
+            return
+        first = (start - self._base_off) // (16 << 20)
+        last = (end - 1 - self._base_off) // (16 << 20)
+        if self._ready_blocks and (
+            self._ready_blocks[first]
+            if first == last
+            else all(self._ready_blocks[first : last + 1])
+        ):
+            return
+        rc = completion.wait_range(start, end)
+        if rc != 0:
+            self.finish_io()
+            raise RuntimeError(f"dma_load_runs failed with rc={rc}")
+        self._ready_blocks[first : last + 1] = b"\x01" * (last - first + 1)
+
+    def finish_io(self) -> None:
+        thread = self._dma_thread
+        if thread is not None:
+            thread.join()
+            self._dma_thread = None
+        if self._dma_error is not None:
+            error = self._dma_error
+            self._dma_error = None
+            raise error
+        if self._dma_rc != 0:
+            rc = self._dma_rc
+            self._dma_rc = 0
+            raise RuntimeError(f"dma_load_runs failed with rc={rc}")
 
     def _start_materialization(self, gbuf: fstcpp.gds_device_buffer) -> None:
         """Create tensor views while O_DIRECT workers populate ``gbuf``.
@@ -270,6 +322,36 @@ class UnifiedMemCopier(CopierInterface):
                 device_id = -1
             else:
                 device_id = self.device.index if self.device.index is not None else 0
+            if self._tensor_readiness:
+                self._submit_path = "dma-stream"
+                self._dma_completion = fstcpp.dma_completion(base_off, starts, ends)
+                block_count = (max(ends) - base_off + (16 << 20) - 1) // (16 << 20)
+                self._ready_blocks = bytearray(block_count)
+                self._dma_error = None
+                self._dma_rc = 0
+
+                def load_in_background() -> None:
+                    try:
+                        self._dma_rc = fstcpp.dma_load_runs_progress(
+                            gbuf.get_base_address(),
+                            self.metadata.src,
+                            base_off,
+                            starts,
+                            ends,
+                            self._dma_threads,
+                            device_id,
+                            self._dma_completion,
+                        )
+                    except BaseException as exc:
+                        self._dma_error = exc
+                        self._dma_completion.finish(-6)
+
+                self._dma_thread = threading.Thread(
+                    target=load_in_background,
+                    name="fastsafetensors-dma",
+                )
+                self._dma_thread.start()
+                return gbuf
             self._start_materialization(gbuf)
             rc = dma_load_runs(
                 gbuf.get_base_address(),
@@ -359,7 +441,11 @@ class UnifiedMemCopier(CopierInterface):
     ) -> Dict[str, TensorBase]:
         profile = os.environ.get("FASTSAFETENSORS_PROFILE") == "1"
         wait_begin = time.perf_counter() if profile else 0.0
-        self.framework.synchronize(self.device)
+        streaming = self._dma_completion is not None
+        if streaming:
+            return {}
+        if not streaming:
+            self.framework.synchronize(self.device)
         sync_done = time.perf_counter() if profile else 0.0
 
         # Alignment note: unlike the GDS copier, we only copy the data section
@@ -397,6 +483,13 @@ class UnifiedMemCopier(CopierInterface):
             )
 
         return tensors
+
+    def materialize_tensor(
+        self, tensor_name: str, gbuf: fstcpp.gds_device_buffer
+    ) -> TensorBase:
+        return self.metadata._get_tensor(
+            tensor_name, gbuf, self.device, self._base_off
+        )
 
 
 def is_unified_memory_system(framework: Optional[FrameworkOpBase] = None) -> bool:

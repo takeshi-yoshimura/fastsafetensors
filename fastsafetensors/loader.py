@@ -203,6 +203,7 @@ class BaseSafeTensorsFileLoader:
         dtype: DType = DType.AUTO,
         use_buf_register: bool = True,
         max_copy_block_size: int = 16 * 1024 * 1024 * 1024,
+        allow_inflight: bool = False,
     ) -> FilesBufferOnDevice:
         """
         trigger copying all the files to device buffers.
@@ -215,6 +216,7 @@ class BaseSafeTensorsFileLoader:
         self.framework.set_device(self.device)
 
         need_wait: List[LazyTensorFactory] = []
+        inflight_factories: Set[int] = set()
         factories: Dict[int, List[LazyTensorFactory]] = {}
         for i in range(0, self.pg.size()):
             factories[i] = []
@@ -233,6 +235,10 @@ class BaseSafeTensorsFileLoader:
                     copier.set_chunk(ranges, names, allocation_size)
                 elif self._tensor_filter is not None:
                     copier.set_byte_ranges(meta.select_byte_ranges(self._tensor_filter))
+                if allow_inflight:
+                    enable = getattr(copier, "enable_tensor_readiness", None)
+                    if enable and enable():
+                        inflight_factories.add(lidx)
             else:
                 copier = None
             factory = LazyTensorFactory(
@@ -252,7 +258,11 @@ class BaseSafeTensorsFileLoader:
                 need_wait.append(factory)
             lidx += 1
         for factory in need_wait:
-            factory.wait_io(dtype=dtype, noalign=False)
+            factory.wait_io(
+                dtype=dtype,
+                noalign=False,
+                allow_inflight=factory.lidx in inflight_factories,
+            )
         if self._chunk_plan:
             # Only this sub-batch's chunk tensors should be registered/visible.
             chunk_keys = set().union(

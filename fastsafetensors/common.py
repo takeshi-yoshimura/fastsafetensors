@@ -409,56 +409,60 @@ class SafeTensorsMetadata:
         for tensor_name, t in self.tensors.items():
             if names is not None and tensor_name not in names:
                 continue
-            dst_dev_ptr = (
-                gbuf.get_base_address()
-                + self.header_length
-                + t.data_offsets[0]
-                - copy_start_offset
+            ret[tensor_name] = self._get_tensor(
+                tensor_name, gbuf, device, copy_start_offset, dtype
             )
-            disk_dtype = self.framework.as_workaround_dtype(t.dtype)
-            dl_shape, dl_strides = self.framework.get_storage_shape(
-                t.dtype, t.shape, t.strides
-            )
-            dl_tensor = from_cuda_buffer(
-                dst_dev_ptr,
-                dl_shape,
-                dl_strides,
-                disk_dtype,
-                device,
-            )
-            t2 = self.framework.from_dlpack(dl_tensor, device, disk_dtype)
-            if disk_dtype != t.dtype:
-                t2 = t2.view(t.dtype)
-            # For packed sub-byte dtypes, reshape to the framework-native shape.
-            # e.g. F4 (float4_e2m1fn_x2): safetensors shape counts FP4 values,
-            # but PyTorch shape counts packed pairs (2 FP4 per byte).
-            native_shape = self.framework.get_native_shape(t.dtype, t.shape)
-            if native_shape != t.shape:
-                t2 = t2.reshape(native_shape)
-
-            if dtype != DType.AUTO and dtype != t.dtype:
-                if self.framework.get_dtype_size(dtype) > self.framework.get_dtype_size(
-                    t.dtype
-                ):
-                    raise Exception(
-                        f"Online type conversion to larger sizes is not supported ({t.dtype} -> {dtype})"
-                    )
-                t3 = t2.to(dtype=dtype)
-                conv_dtype: DType = self.framework.as_workaround_dtype(dtype)
-                dl_tensor = from_cuda_buffer(
-                    dst_dev_ptr,
-                    t.shape,
-                    t.strides,
-                    conv_dtype,
-                    device,
-                )
-                t2 = self.framework.from_dlpack(dl_tensor, device, conv_dtype)
-                if dtype != conv_dtype:
-                    t2 = t2.view(dtype)
-                self.framework.copy_tensor(t2, t3)
-                self.tensors[tensor_name].dtype = dtype
-            ret[tensor_name] = t2
         return ret
+
+    def _get_tensor(
+        self,
+        tensor_name: str,
+        gbuf: fstcpp.gds_device_buffer,
+        device: Device,
+        copy_start_offset: int,
+        dtype: DType = DType.AUTO,
+    ) -> TensorBase:
+        """Instantiate one tensor view without scanning the shard metadata."""
+        t = self.tensors[tensor_name]
+        dst_dev_ptr = (
+            gbuf.get_base_address()
+            + self.header_length
+            + t.data_offsets[0]
+            - copy_start_offset
+        )
+        disk_dtype = self.framework.as_workaround_dtype(t.dtype)
+        dl_shape, dl_strides = self.framework.get_storage_shape(
+            t.dtype, t.shape, t.strides
+        )
+        dl_tensor = from_cuda_buffer(
+            dst_dev_ptr, dl_shape, dl_strides, disk_dtype, device
+        )
+        tensor = self.framework.from_dlpack(dl_tensor, device, disk_dtype)
+        if disk_dtype != t.dtype:
+            tensor = tensor.view(t.dtype)
+        native_shape = self.framework.get_native_shape(t.dtype, t.shape)
+        if native_shape != t.shape:
+            tensor = tensor.reshape(native_shape)
+
+        if dtype != DType.AUTO and dtype != t.dtype:
+            if self.framework.get_dtype_size(dtype) > self.framework.get_dtype_size(
+                t.dtype
+            ):
+                raise Exception(
+                    "Online type conversion to larger sizes is not supported "
+                    f"({t.dtype} -> {dtype})"
+                )
+            converted = tensor.to(dtype=dtype)
+            conv_dtype: DType = self.framework.as_workaround_dtype(dtype)
+            dl_tensor = from_cuda_buffer(
+                dst_dev_ptr, t.shape, t.strides, conv_dtype, device
+            )
+            tensor = self.framework.from_dlpack(dl_tensor, device, conv_dtype)
+            if dtype != conv_dtype:
+                tensor = tensor.view(dtype)
+            self.framework.copy_tensor(tensor, converted)
+            self.tensors[tensor_name].dtype = dtype
+        return tensor
 
     def select_byte_ranges(
         self, keep_tensor: Callable[[str], bool], merge_gap: int = 4096

@@ -99,6 +99,7 @@ class FilesBufferOnDevice:
         dtype: DType,
     ) -> TensorBase:
         loader = self.rank_loaders[rank][lidx]
+        loader.wait_tensor(tensor_name)
         if self.auto_mem_delete:
             self.instantiated[rank][lidx][tensor_name] = True
             if len(self.instantiated[rank][lidx]) == len(loader.metadata.tensors):
@@ -124,6 +125,7 @@ class FilesBufferOnDevice:
         cloned/copied it to independent storage.
         """
         rank, lidix = self._get_rank_lidx(tensor_name)
+        self.rank_loaders[rank][lidix].wait_tensor(tensor_name)
         t = self.rank_loaders[rank][lidix].shuffle(self.pg, tensor_name, dim)
         return self._get_tensor(rank, lidix, tensor_name, t, device, dtype)
 
@@ -182,6 +184,7 @@ class FilesBufferOnDevice:
             raise RuntimeError("iter_local_tensors requires a single-process group")
         for tensor_name in tensor_names:
             rank, lidx = self._get_rank_lidx(tensor_name)
+            self.rank_loaders[rank][lidx].wait_tensor(tensor_name)
             yield tensor_name, self.rank_loaders[rank][lidx].tensors[
                 tensor_name
             ].get_raw()

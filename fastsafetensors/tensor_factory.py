@@ -28,6 +28,7 @@ class LazyTensorFactory:
         self.metadata = metadata
         self.device = device
         self.copier: Optional[CopierInterface] = None
+        self.inflight_copier: Optional[CopierInterface] = None
         if local_rank:
             self.copier = copier
         self.tensors: Dict[str, TensorBase] = {}
@@ -47,13 +48,31 @@ class LazyTensorFactory:
                     "submit_io: new buf, addr=0x%x", self.gbuf.get_base_address()
                 )
 
-    def wait_io(self, dtype: DType = DType.AUTO, noalign: bool = False):
+    def wait_io(
+        self,
+        dtype: DType = DType.AUTO,
+        noalign: bool = False,
+        allow_inflight: bool = False,
+    ):
         if self.copier is not None and self.gbuf is not None:
             self.tensors = self.copier.wait_io(self.gbuf, dtype=dtype, noalign=noalign)
             if is_debug(logger):
                 for name in self.tensors.keys():
                     logger.debug("wait_io: tensor=%s", name)
+            if allow_inflight and getattr(self.copier, "wait_tensor", None) is not None:
+                self.inflight_copier = self.copier
             self.copier = None
+
+    def wait_tensor(self, tensor_name: str) -> None:
+        if tensor_name in self.tensors:
+            return
+        if self.inflight_copier is not None:
+            self.inflight_copier.wait_tensor(tensor_name)  # type: ignore[attr-defined]
+            if tensor_name not in self.tensors:
+                assert self.gbuf is not None
+                self.tensors[tensor_name] = self.inflight_copier.materialize_tensor(  # type: ignore[attr-defined]
+                    tensor_name, self.gbuf
+                )
 
     def push(
         self,
@@ -259,10 +278,21 @@ class LazyTensorFactory:
         return dst
 
     def free_dev_ptrs(self):
-        self.tensors = {}
-        if self.gbuf is not None and not isinstance(self.gbuf, DummyDeviceBuffer):
-            self.framework.free_tensor_memory(self.gbuf, self.device)
-            logger.debug(
-                "free_dev_ptrs: delete buf, addr=0x%x", self.gbuf.get_base_address()
-            )
-            self.gbuf = None
+        error: Optional[BaseException] = None
+        try:
+            if self.inflight_copier is not None:
+                self.inflight_copier.finish_io()  # type: ignore[attr-defined]
+        except BaseException as exc:
+            error = exc
+        finally:
+            self.inflight_copier = None
+            self.tensors = {}
+            if self.gbuf is not None and not isinstance(self.gbuf, DummyDeviceBuffer):
+                self.framework.free_tensor_memory(self.gbuf, self.device)
+                logger.debug(
+                    "free_dev_ptrs: delete buf, addr=0x%x",
+                    self.gbuf.get_base_address(),
+                )
+                self.gbuf = None
+        if error is not None:
+            raise error

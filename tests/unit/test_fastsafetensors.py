@@ -493,6 +493,67 @@ def test_UnifiedMemCopier_overlaps_materialization(
     assert framework.get_mem_used() == 0
 
 
+def test_UnifiedMemCopier_tensor_readiness(
+    fstcpp_log, input_files, framework, monkeypatch
+) -> None:
+    """A tensor can be exposed before the chunk's background DMA finishes."""
+    print("test_UnifiedMemCopier_tensor_readiness")
+    _skip_if_not_pytorch(framework)
+    import ctypes
+    import os
+    import threading
+
+    meta = SafeTensorsMetadata.from_file(input_files[0], framework)
+    device = Device.from_str("cpu")
+    dma_started = threading.Event()
+    tensor_ready = threading.Event()
+    dma_finished = threading.Event()
+
+    class FakeCompletion:
+        def __init__(self, base, starts, ends):
+            pass
+
+        def wait_range(self, start, end):
+            assert tensor_ready.wait(2)
+            return 0
+
+    def fake_dma(dst, path, base_off, starts, ends, threads, device_id, completion):
+        dma_started.set()
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            for start, end in zip(starts, ends):
+                data = os.pread(fd, end - start, start)
+                ctypes.memmove(dst + start - base_off, data, len(data))
+        finally:
+            os.close(fd)
+        tensor_ready.set()
+        assert dma_finished.wait(2)
+        return 0
+
+    monkeypatch.setattr(fstcpp, "dma_completion", FakeCompletion)
+    monkeypatch.setattr(fstcpp, "dma_load_runs_progress", fake_dma)
+    monkeypatch.setenv("FASTSAFETENSORS_DMA_THREADS", "1")
+    monkeypatch.setenv("FASTSAFETENSORS_ODIRECT", "1")
+
+    copier = UnifiedMemCopier(meta, device, framework)
+    assert copier.enable_tensor_readiness()
+    gbuf = copier.submit_io(False, 10 * 1024 * 1024 * 1024)
+    assert dma_started.wait(2)
+    tensors = copier.wait_io(gbuf)
+    assert tensors == {}
+    name = next(iter(meta.tensors))
+    copier.wait_tensor(name)
+    tensor = copier.materialize_tensor(name, gbuf)
+    assert framework.is_equal(
+        tensor, load_safetensors_file(input_files[0], device, framework)[name]
+    )
+    assert not dma_finished.is_set()
+    dma_finished.set()
+    copier.finish_io()
+    framework.free_tensor_memory(gbuf, device)
+    assert framework.get_mem_used() == 0
+
+
 def test_UnifiedMemCopier_cuda_error(
     fstcpp_log, input_files, framework, monkeypatch
 ) -> None:

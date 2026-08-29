@@ -489,7 +489,9 @@ class PipelineParallel:
             with TimingContext(
                 "copy_files_to_device", self._log_message, batch_id
             ) as timer:
-                fb = self.loader.copy_files_to_device()
+                fb = self.loader.copy_files_to_device(
+                    allow_inflight=self.borrowed_tensors and self.loader.pg.size() == 1
+                )
             copy_time = timer.elapsed_ms
 
             # Get tensor keys

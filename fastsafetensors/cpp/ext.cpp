@@ -116,6 +116,8 @@ static inline int munmap(void* addr, size_t /*length*/) {
 #include <thread>
 #include <vector>
 #include <mutex>
+#include <condition_variable>
+#include <memory>
 
 #include "gpu_compat.h"
 #include "ext.hpp"
@@ -1166,6 +1168,75 @@ static std::vector<void *> g_pin_pool;
 static const size_t PIN_CHUNK = 16UL << 20;
 static const unsigned int PIN_FLAG_PORTABLE = 0x1;
 
+class dma_completion {
+public:
+    dma_completion(size_t base, const std::vector<size_t> &starts,
+                   const std::vector<size_t> &ends)
+        : _base(base), _done(false), _rc(0) {
+        size_t limit = base;
+        for (size_t e : ends) limit = std::max(limit, e);
+        _blocks = (limit > base) ? (limit - base + PIN_CHUNK - 1) / PIN_CHUNK : 0;
+        _pending.reset(new std::atomic<size_t>[_blocks]);
+        for (size_t i = 0; i < _blocks; i++) _pending[i].store(0);
+        for (size_t r = 0; r < starts.size(); r++) {
+            size_t p = starts[r];
+            while (p < ends[r]) {
+                size_t b = (p - _base) / PIN_CHUNK;
+                size_t stop = std::min(ends[r], _base + (b + 1) * PIN_CHUNK);
+                _pending[b].fetch_add(stop - p);
+                p = stop;
+            }
+        }
+    }
+
+    void complete(size_t start, size_t end) {
+        size_t p = start;
+        while (p < end) {
+            size_t b = (p - _base) / PIN_CHUNK;
+            size_t stop = std::min(end, _base + (b + 1) * PIN_CHUNK);
+            _pending[b].fetch_sub(stop - p, std::memory_order_acq_rel);
+            p = stop;
+        }
+        _cv.notify_all();
+    }
+
+    int wait_range(size_t start, size_t end) {
+        if (start >= end) return 0;
+        const size_t first = (start - _base) / PIN_CHUNK;
+        const size_t last = (end - 1 - _base) / PIN_CHUNK;
+        std::unique_lock<std::mutex> lock(_mutex);
+        _cv.wait(lock, [&]() {
+            if (_done.load(std::memory_order_acquire)) return true;
+            for (size_t b = first; b <= last; b++) {
+                if (_pending[b].load(std::memory_order_acquire) != 0) return false;
+            }
+            return true;
+        });
+        for (size_t b = first; b <= last; b++) {
+            if (_pending[b].load(std::memory_order_acquire) != 0) {
+                const int rc = _rc.load();
+                return rc != 0 ? rc : -5;
+            }
+        }
+        return 0;
+    }
+
+    void finish(int rc) {
+        _rc.store(rc, std::memory_order_release);
+        _done.store(true, std::memory_order_release);
+        _cv.notify_all();
+    }
+
+private:
+    size_t _base;
+    size_t _blocks;
+    std::unique_ptr<std::atomic<size_t>[]> _pending;
+    std::atomic<bool> _done;
+    std::atomic<int> _rc;
+    std::mutex _mutex;
+    std::condition_variable _cv;
+};
+
 static void *pin_acquire(bool *reused) {
     {
         std::lock_guard<std::mutex> lk(g_pin_mtx);
@@ -1193,7 +1264,8 @@ static int dma_load_runs(uintptr_t gbuf_dev, const std::string &path,
                          size_t header_len,
                          const std::vector<size_t> &starts,
                          const std::vector<size_t> &ends, int nthreads,
-                         int device_id) {
+                         int device_id,
+                         const std::shared_ptr<dma_completion> &completion = nullptr) {
     if (!cuda_fns.cudaHostAlloc || !cuda_fns.cudaMemcpy || !cuda_fns.cudaFreeHost
         || !cuda_fns.cudaDeviceSynchronize) {
         return -10;
@@ -1305,6 +1377,7 @@ static int dma_load_runs(uintptr_t gbuf_dev, const std::string &path,
                             profile_copy_bytes += (uint64_t)(ce - cs);
                         }
                         if (e != cudaSuccess) { rc = -4; break; }
+                        if (completion) completion->complete(cs, ce);
                     }
                     if (fo_end >= fend) break;
                 }
@@ -1326,6 +1399,7 @@ static int dma_load_runs(uintptr_t gbuf_dev, const std::string &path,
         });
     }
     for (auto &t : threads) t.join();
+    if (completion) completion->finish(rc.load());
     if (profile) {
         const uint64_t wall_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - wall_begin).count();
         std::fprintf(stderr, "[FST_PROFILE] dma file=%s requested=%zu read=%" PRIu64 " copied=%" PRIu64 " threads=%zu read_ops=%" PRIu64 " copy_ops=%" PRIu64 " wall_ms=%.3f pin_worker_ms=%.3f open_worker_ms=%.3f pread_worker_ms=%.3f memcpy_worker_ms=%.3f sync_worker_ms=%.3f rc=%d\n", path.c_str(), total, profile_read_bytes.load(), profile_copy_bytes.load(), threads.size(), profile_read_ops.load(), profile_copy_ops.load(), wall_us/1000.0, profile_pin_us.load()/1000.0, profile_open_us.load()/1000.0, profile_pread_us.load()/1000.0, profile_memcpy_us.load()/1000.0, profile_sync_us.load()/1000.0, rc.load());
@@ -1376,6 +1450,15 @@ PYBIND11_MODULE(__MOD_NAME__, m)
     m.def("load_library_functions", &load_library_functions,
           pybind11::arg("cudart_lib_name") = "");
     m.def("memcpy_h2d_async", &memcpy_h2d_async);
+    pybind11::class_<dma_completion, std::shared_ptr<dma_completion>>(
+        m, "dma_completion")
+        .def(pybind11::init<size_t, const std::vector<size_t> &,
+                           const std::vector<size_t> &>())
+        .def("wait_range", [](dma_completion &self, size_t start, size_t end) {
+            pybind11::gil_scoped_release release;
+            return self.wait_range(start, end);
+        })
+        .def("finish", &dma_completion::finish);
     m.def(
         "dma_load_runs",
         [](uintptr_t gbuf_dev, const std::string &path, size_t header_len,
@@ -1389,6 +1472,22 @@ PYBIND11_MODULE(__MOD_NAME__, m)
         pybind11::arg("header_len"), pybind11::arg("starts"),
         pybind11::arg("ends"), pybind11::arg("nthreads") = 8,
         pybind11::arg("device_id") = -1);
+    m.def(
+        "dma_load_runs_progress",
+        [](uintptr_t gbuf_dev, const std::string &path, size_t header_len,
+           const std::vector<size_t> &starts, const std::vector<size_t> &ends,
+           int nthreads, int device_id,
+           const std::shared_ptr<dma_completion> &completion) {
+            pybind11::gil_scoped_release release;
+            int rc = dma_load_runs(gbuf_dev, path, header_len, starts, ends,
+                                   nthreads, device_id, completion);
+            completion->finish(rc);
+            return rc;
+        },
+        pybind11::arg("gbuf_dev"), pybind11::arg("path"),
+        pybind11::arg("header_len"), pybind11::arg("starts"),
+        pybind11::arg("ends"), pybind11::arg("nthreads"),
+        pybind11::arg("device_id"), pybind11::arg("completion"));
     m.def("get_cpp_metrics", &get_cpp_metrics);
     m.def("set_gil_release", &set_gil_release);
     m.def("get_gil_release", &get_gil_release);
