@@ -309,6 +309,52 @@ class TorchOp(FrameworkOpBase[TorchTensor, TorchProcessGroup]):
         t = torch.from_dlpack(dl_tensor)
         return TorchTensor(device, dtype, t)
 
+    def iter_buffer_views(self, metadata, gbuf, device, copy_start_offset, names):
+        """Yield views using a few typed storages and one as_strided per tensor."""
+        from ..dlpack import from_cuda_buffer
+
+        selected = [name for name in metadata.tensors if names is None or name in names]
+        base_address = gbuf.get_base_address()
+        buffer_end = base_address + gbuf.get_length()
+        bases = {}
+
+        for name in selected:
+            frame = metadata.tensors[name]
+            disk_dtype = self.as_workaround_dtype(frame.dtype)
+            itemsize = int(self.get_dtype_size(disk_dtype))
+            tensor_address = (
+                base_address
+                + metadata.header_length
+                + frame.data_offsets[0]
+                - copy_start_offset
+            )
+            residue = tensor_address % itemsize
+            key = (disk_dtype, residue)
+            entry = bases.get(key)
+            if entry is None:
+                shift = (residue - base_address % itemsize) % itemsize
+                typed_address = base_address + shift
+                elements = (buffer_end - typed_address) // itemsize
+                capsule = from_cuda_buffer(
+                    typed_address, [elements], [1], disk_dtype, device
+                )
+                raw_base = torch.from_dlpack(capsule)
+                entry = (typed_address, raw_base)
+                bases[key] = entry
+            typed_address, raw_base = entry
+            storage_offset = (tensor_address - typed_address) // itemsize
+            shape, strides = self.get_storage_shape(
+                frame.dtype, frame.shape, frame.strides
+            )
+            raw = torch.as_strided(raw_base, shape, strides, storage_offset)
+            tensor = TorchTensor(device, disk_dtype, raw)
+            if disk_dtype != frame.dtype:
+                tensor = tensor.view(frame.dtype)
+            native_shape = self.get_native_shape(frame.dtype, frame.shape)
+            if native_shape != frame.shape:
+                tensor = tensor.reshape(native_shape)
+            yield name, tensor
+
     def copy_tensor(self, dst: TorchTensor, src: TorchTensor):
         dst.real_tensor.copy_(src.real_tensor)
 

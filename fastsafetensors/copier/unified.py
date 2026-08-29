@@ -202,10 +202,20 @@ class UnifiedMemCopier(CopierInterface):
             begin = time.perf_counter()
             try:
                 self.framework.set_device(self.device)
-                for index, name in enumerate(names, 1):
-                    tensor = self.metadata._get_tensor(
-                        name, gbuf, self.device, self._base_off
+                views = self.framework.iter_buffer_views(
+                    self.metadata, gbuf, self.device, self._base_off, self._chunk_names
+                )
+                if views is None:
+                    views = (
+                        (
+                            name,
+                            self.metadata._get_tensor(
+                                name, gbuf, self.device, self._base_off
+                            ),
+                        )
+                        for name in names
                     )
+                for index, (name, tensor) in enumerate(views, 1):
                     assert self._materialized is not None
                     self._materialized[name] = tensor
                     # Amortize condition locking while bounding the delay for a

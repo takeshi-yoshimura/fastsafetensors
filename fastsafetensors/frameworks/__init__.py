@@ -205,6 +205,13 @@ class FrameworkOpBase(ABC, Generic[T, K]):
         """
         return slices
 
+    def iter_buffer_views(self, metadata, gbuf, device, copy_start_offset, names):
+        """Optionally yield optimized ``(name, tensor)`` buffer views.
+
+        Returning ``None`` selects the portable per-tensor DLPack path.
+        """
+        return None
+
     def synchronize(self, device: Device) -> None:
         """Block until pending asynchronous device copies are complete.
 
