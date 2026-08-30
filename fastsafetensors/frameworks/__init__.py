@@ -77,6 +77,15 @@ class ProcessGroupBase(ABC, Generic[T]):
     def broadcast(self, dst: T, rank: int) -> None:
         pass
 
+    def broadcast_many(self, dsts: List[T], rank: int) -> None:
+        """Broadcast a run of tensors from one rank.
+
+        Frameworks may override this to coalesce the run into fewer
+        collectives.  The default preserves the original per-tensor behavior.
+        """
+        for dst in dsts:
+            self.broadcast(dst, rank)
+
     @abstractmethod
     def scatter(
         self,
@@ -109,6 +118,36 @@ K = TypeVar("K", bound=ProcessGroupBase)
 
 
 class FrameworkOpBase(ABC, Generic[T, K]):
+    def exchange_contiguous_runs(
+        self,
+        pg: K,
+        source_tensors: List[List[Optional[T]]],
+        frames: List[List[Any]],
+        device: Device,
+    ) -> Optional[Tuple[List[List[T]], int, int]]:
+        """Exchange rank-0/rank-1 byte runs concurrently.
+
+        Returns two lists of tensor views plus communication and view time.
+        Frameworks without a direct byte-span implementation return None.
+        """
+        return None
+
+    def broadcast_contiguous_run(
+        self,
+        pg: K,
+        source_tensors: List[Optional[T]],
+        frames: List[Any],
+        src_rank: int,
+        device: Device,
+    ) -> Optional[Tuple[List[T], int, int]]:
+        """Broadcast one contiguous byte run and return tensor views.
+
+        Frameworks without a zero-copy byte-span implementation return None;
+        callers then fall back to the portable per-tensor/coalesced path. The
+        tuple contains tensors, broadcast nanoseconds, and view nanoseconds.
+        """
+        return None
+
     @abstractmethod
     def get_name(self) -> str:
         pass

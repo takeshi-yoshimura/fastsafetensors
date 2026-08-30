@@ -1171,13 +1171,20 @@ static const unsigned int PIN_FLAG_PORTABLE = 0x1;
 class dma_completion {
 public:
     dma_completion(size_t base, const std::vector<size_t> &starts,
-                   const std::vector<size_t> &ends)
-        : _base(base), _done(false), _rc(0) {
+                   const std::vector<size_t> &ends, bool profile = false)
+        : _base(base), _done(false), _rc(0), _profile(profile),
+          _submit_time(std::chrono::steady_clock::now()) {
         size_t limit = base;
         for (size_t e : ends) limit = std::max(limit, e);
         _blocks = (limit > base) ? (limit - base + PIN_CHUNK - 1) / PIN_CHUNK : 0;
         _pending.reset(new std::atomic<size_t>[_blocks]);
+        _pread_active.reset(new std::atomic<unsigned int>[_blocks]);
+        _h2d_active.reset(new std::atomic<unsigned int>[_blocks]);
         for (size_t i = 0; i < _blocks; i++) _pending[i].store(0);
+        for (size_t i = 0; i < _blocks; i++) {
+            _pread_active[i].store(0);
+            _h2d_active[i].store(0);
+        }
         for (size_t r = 0; r < starts.size(); r++) {
             size_t p = starts[r];
             while (p < ends[r]) {
@@ -1188,6 +1195,11 @@ public:
             }
         }
     }
+
+    void begin_pread(size_t start, size_t end) { stage_range(start, end, _pread_active, 1); }
+    void end_pread(size_t start, size_t end) { stage_range(start, end, _pread_active, -1); }
+    void begin_h2d(size_t start, size_t end) { stage_range(start, end, _h2d_active, 1); }
+    void end_h2d(size_t start, size_t end) { stage_range(start, end, _h2d_active, -1); }
 
     void complete(size_t start, size_t end) {
         size_t p = start;
@@ -1221,6 +1233,43 @@ public:
         return 0;
     }
 
+    // Returns rc, submit age, block count, pending bytes at entry, whether the
+    // range was ready at entry, then wall time spent under each activity mask:
+    // 1=queued, 2=pread, 4=H2D (masks may be combined across blocks).
+    std::vector<int64_t> wait_range_profile(size_t start, size_t end) {
+        std::vector<int64_t> out(13, 0);
+        if (start >= end) return out;
+        const size_t first = (start - _base) / PIN_CHUNK;
+        const size_t last = (end - 1 - _base) / PIN_CHUNK;
+        out[2] = last - first + 1;
+        auto now = std::chrono::steady_clock::now();
+        out[1] = std::chrono::duration_cast<std::chrono::microseconds>(
+                     now - _submit_time).count();
+        for (size_t b = first; b <= last; b++) out[3] += _pending[b].load();
+        out[4] = range_ready(first, last) ? 1 : 0;
+
+        std::unique_lock<std::mutex> lock(_mutex);
+        auto previous = now;
+        while (!_done.load(std::memory_order_acquire) && !range_ready(first, last)) {
+            const unsigned int mask = activity_mask(first, last);
+            _cv.wait_for(lock, std::chrono::microseconds(200));
+            now = std::chrono::steady_clock::now();
+            if (mask != 0) {
+                out[5 + mask] += std::chrono::duration_cast<std::chrono::microseconds>(
+                                     now - previous).count();
+            }
+            previous = now;
+        }
+        for (size_t b = first; b <= last; b++) {
+            if (_pending[b].load(std::memory_order_acquire) != 0) {
+                const int rc = _rc.load();
+                out[0] = rc != 0 ? rc : -5;
+                return out;
+            }
+        }
+        return out;
+    }
+
     void finish(int rc) {
         _rc.store(rc, std::memory_order_release);
         _done.store(true, std::memory_order_release);
@@ -1228,11 +1277,48 @@ public:
     }
 
 private:
+    bool range_ready(size_t first, size_t last) const {
+        for (size_t b = first; b <= last; b++) {
+            if (_pending[b].load(std::memory_order_acquire) != 0) return false;
+        }
+        return true;
+    }
+
+    unsigned int activity_mask(size_t first, size_t last) const {
+        unsigned int mask = 0;
+        for (size_t b = first; b <= last; b++) {
+            if (_pending[b].load(std::memory_order_acquire) == 0) continue;
+            const bool pread = _pread_active[b].load(std::memory_order_acquire) != 0;
+            const bool h2d = _h2d_active[b].load(std::memory_order_acquire) != 0;
+            if (!pread && !h2d) mask |= 1;
+            if (pread) mask |= 2;
+            if (h2d) mask |= 4;
+        }
+        return mask;
+    }
+
+    void stage_range(size_t start, size_t end,
+                     std::unique_ptr<std::atomic<unsigned int>[]> &active,
+                     int delta) {
+        if (!_profile || start >= end) return;
+        const size_t first = (start - _base) / PIN_CHUNK;
+        const size_t last = (end - 1 - _base) / PIN_CHUNK;
+        for (size_t b = first; b <= last; b++) {
+            if (delta > 0) active[b].fetch_add(1, std::memory_order_acq_rel);
+            else active[b].fetch_sub(1, std::memory_order_acq_rel);
+        }
+        _cv.notify_all();
+    }
+
     size_t _base;
     size_t _blocks;
     std::unique_ptr<std::atomic<size_t>[]> _pending;
+    std::unique_ptr<std::atomic<unsigned int>[]> _pread_active;
+    std::unique_ptr<std::atomic<unsigned int>[]> _h2d_active;
     std::atomic<bool> _done;
     std::atomic<int> _rc;
+    bool _profile;
+    std::chrono::steady_clock::time_point _submit_time;
     std::mutex _mutex;
     std::condition_variable _cv;
 };
@@ -1351,8 +1437,12 @@ static int dma_load_runs(uintptr_t gbuf_dev, const std::string &path,
                     size_t want = fend - fo;
                     size_t reqlen = (want >= CHUNK) ? CHUNK
                                                     : ((want + ALN - 1) & ~(ALN - 1));
+                    size_t ps = fo > fstart ? fo : fstart;
+                    size_t pe = (fo + reqlen) < fend ? (fo + reqlen) : fend;
+                    if (completion) completion->begin_pread(ps, pe);
                     profile_t0 = std::chrono::steady_clock::now();
                     ssize_t got = pread(fd, pinned, reqlen, fo);
+                    if (completion) completion->end_pread(ps, pe);
                     if (profile) {
                         const uint64_t elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - profile_t0).count();
                         profile_pread_us += elapsed;
@@ -1365,10 +1455,12 @@ static int dma_load_runs(uintptr_t gbuf_dev, const std::string &path,
                     size_t cs = fo > fstart ? fo : fstart;  // copy only [fstart,fend)
                     size_t ce = fo_end < fend ? fo_end : fend;
                     if (cs < ce) {
+                        if (completion) completion->begin_h2d(cs, ce);
                         profile_t0 = std::chrono::steady_clock::now();
                         cudaError_t e = cuda_fns.cudaMemcpy(
                             gbuf + (cs - header_len), (char *)pinned + (cs - fo),
                             ce - cs, cudaMemcpyHostToDevice);
+                        if (completion) completion->end_h2d(cs, ce);
                         if (profile) {
                             const uint64_t elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - profile_t0).count();
                             profile_memcpy_us += elapsed;
@@ -1453,10 +1545,16 @@ PYBIND11_MODULE(__MOD_NAME__, m)
     pybind11::class_<dma_completion, std::shared_ptr<dma_completion>>(
         m, "dma_completion")
         .def(pybind11::init<size_t, const std::vector<size_t> &,
-                           const std::vector<size_t> &>())
+                           const std::vector<size_t> &, bool>(),
+             pybind11::arg("base"), pybind11::arg("starts"),
+             pybind11::arg("ends"), pybind11::arg("profile") = false)
         .def("wait_range", [](dma_completion &self, size_t start, size_t end) {
             pybind11::gil_scoped_release release;
             return self.wait_range(start, end);
+        })
+        .def("wait_range_profile", [](dma_completion &self, size_t start, size_t end) {
+            pybind11::gil_scoped_release release;
+            return self.wait_range_profile(start, end);
         })
         .def("finish", &dma_completion::finish);
     m.def(

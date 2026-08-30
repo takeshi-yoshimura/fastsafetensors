@@ -137,18 +137,56 @@ class TorchProcessGroup(ProcessGroupBase[TorchTensor]):
     def broadcast(self, dst: TorchTensor, rank: int) -> None:
         if self.real_pg:
             if _needs_uint8_view(dst.dtype):
-                dist.broadcast(
-                    dst.real_tensor.view(torch.uint8), rank, group=self.real_pg
+                work = dist.broadcast(
+                    dst.real_tensor.view(torch.uint8),
+                    rank,
+                    group=self.real_pg,
+                    async_op=True,
                 )
             elif _is_fp8(dst.dtype) and _needs_fp8_cast():
                 buf = dst.real_tensor.to(torch.bfloat16)
-                dist.broadcast(buf, rank, group=self.real_pg)
+                work = dist.broadcast(buf, rank, group=self.real_pg, async_op=True)
+                work.wait()
                 dst.real_tensor.copy_(buf.to(dst.real_tensor.dtype))
                 del buf
+                return
             else:
-                dist.broadcast(dst.real_tensor, rank, group=self.real_pg)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+                work = dist.broadcast(
+                    dst.real_tensor, rank, group=self.real_pg, async_op=True
+                )
+            # For NCCL this installs a dependency on the current CUDA stream;
+            # it does not stop unrelated device work as cuda.synchronize does.
+            work.wait()
+
+    def broadcast_many(self, dsts: List[TorchTensor], rank: int) -> None:
+        if not self.real_pg or not dsts:
+            return
+
+        # _broadcast_coalesced packs tensors into large flat buffers internally,
+        # reducing launch/round-trip overhead without requiring the checkpoint
+        # tensors themselves to be contiguous or have the same dtype.
+        tensors = []
+        converted = []
+        for dst in dsts:
+            if _needs_uint8_view(dst.dtype):
+                tensors.append(dst.real_tensor.view(torch.uint8))
+                converted.append(None)
+            elif _is_fp8(dst.dtype) and _needs_fp8_cast():
+                buf = dst.real_tensor.to(torch.bfloat16)
+                tensors.append(buf)
+                converted.append(buf)
+            else:
+                tensors.append(dst.real_tensor)
+                converted.append(None)
+
+        # The caller already bounds a run.  Passing its total size lets c10d
+        # issue one coalesced buffer per dtype in the common case.
+        buffer_size = max(sum(t.numel() * t.element_size() for t in tensors), 1)
+        dist._broadcast_coalesced(self.real_pg, tensors, buffer_size, rank)
+
+        for dst, buf in zip(dsts, converted):
+            if buf is not None:
+                dst.real_tensor.copy_(buf.to(dst.real_tensor.dtype))
 
     def scatter(
         self,
@@ -228,6 +266,107 @@ class TorchProcessGroup(ProcessGroupBase[TorchTensor]):
 
 
 class TorchOp(FrameworkOpBase[TorchTensor, TorchProcessGroup]):
+    @staticmethod
+    def _flat_source_run(tensors: List[TorchTensor], sizes: List[int]) -> torch.Tensor:
+        if not tensors:
+            return torch.empty(0, dtype=torch.uint8)
+        for previous, current, previous_size in zip(tensors, tensors[1:], sizes):
+            if previous.data_ptr() + previous_size != current.data_ptr():
+                raise RuntimeError(
+                    "broadcast byte run is not contiguous in device memory"
+                )
+        first = tensors[0].real_tensor
+        byte_offset = first.data_ptr() - first.untyped_storage().data_ptr()
+        return torch.empty(0, dtype=torch.uint8, device=first.device).set_(
+            first.untyped_storage(), byte_offset, (sum(sizes),), (1,)
+        )
+
+    def _views_from_flat(
+        self, flat: torch.Tensor, frames: List[Any], device: Device
+    ) -> List[TorchTensor]:
+        outputs: List[TorchTensor] = []
+        offset = 0
+        for frame in frames:
+            size = frame.data_offsets[1] - frame.data_offsets[0]
+            raw = flat.narrow(0, offset, size).view(dtype_convert[frame.dtype])
+            raw = raw.reshape(self.get_native_shape(frame.dtype, frame.shape))
+            outputs.append(TorchTensor(device, frame.dtype, raw))
+            offset += size
+        return outputs
+
+    def exchange_contiguous_runs(
+        self,
+        pg: TorchProcessGroup,
+        source_tensors: List[List[Optional[TorchTensor]]],
+        frames: List[List[Any]],
+        device: Device,
+    ) -> Optional[Tuple[List[List[TorchTensor]], int, int]]:
+        if pg.real_pg is None or pg.size() != 2 or len(frames) != 2:
+            return None
+        rank = pg.rank()
+        peer = 1 - rank
+        local_sizes = [
+            frame.data_offsets[1] - frame.data_offsets[0] for frame in frames[rank]
+        ]
+        local_tensors = [tensor for tensor in source_tensors[rank] if tensor]
+        if len(local_tensors) != len(frames[rank]):
+            raise RuntimeError("source rank is missing a tensor in a byte run")
+        send = self._flat_source_run(local_tensors, local_sizes)
+        recv_bytes = sum(
+            frame.data_offsets[1] - frame.data_offsets[0] for frame in frames[peer]
+        )
+        recv = torch.empty(recv_bytes, dtype=torch.uint8, device=device.as_str())
+
+        profile = os.environ.get("FASTSAFETENSORS_PROFILE") == "1"
+        exchange_begin = time.perf_counter_ns() if profile else 0
+        ops = [
+            dist.P2POp(dist.isend, send, peer, group=pg.real_pg),
+            dist.P2POp(dist.irecv, recv, peer, group=pg.real_pg),
+        ]
+        for work in dist.batch_isend_irecv(ops):
+            work.wait()
+        exchange_ns = time.perf_counter_ns() - exchange_begin if profile else 0
+
+        view_begin = time.perf_counter_ns() if profile else 0
+        flats = [send, recv] if rank == 0 else [recv, send]
+        outputs = [
+            self._views_from_flat(flat, run_frames, device)
+            for flat, run_frames in zip(flats, frames)
+        ]
+        view_ns = time.perf_counter_ns() - view_begin if profile else 0
+        return outputs, exchange_ns, view_ns
+
+    def broadcast_contiguous_run(
+        self,
+        pg: TorchProcessGroup,
+        source_tensors: List[Optional[TorchTensor]],
+        frames: List[Any],
+        src_rank: int,
+        device: Device,
+    ) -> Optional[Tuple[List[TorchTensor], int, int]]:
+        if not frames:
+            return [], 0, 0
+        sizes = [frame.data_offsets[1] - frame.data_offsets[0] for frame in frames]
+        total_bytes = sum(sizes)
+
+        if pg.rank() == src_rank:
+            tensors = [tensor for tensor in source_tensors if tensor is not None]
+            if len(tensors) != len(frames):
+                raise RuntimeError("source rank is missing a tensor in a byte run")
+            flat = self._flat_source_run(tensors, sizes)
+        else:
+            flat = torch.empty(total_bytes, dtype=torch.uint8, device=device.as_str())
+
+        profile = os.environ.get("FASTSAFETENSORS_PROFILE") == "1"
+        broadcast_begin = time.perf_counter_ns() if profile else 0
+        pg.broadcast(TorchTensor(device, DType.U8, flat), src_rank)
+        broadcast_ns = time.perf_counter_ns() - broadcast_begin if profile else 0
+
+        view_begin = time.perf_counter_ns() if profile else 0
+        outputs = self._views_from_flat(flat, frames, device)
+        view_ns = time.perf_counter_ns() - view_begin if profile else 0
+        return outputs, broadcast_ns, view_ns
+
     def __init__(self) -> None:
         self.mem_used = 0
 
@@ -466,7 +605,7 @@ class TorchOp(FrameworkOpBase[TorchTensor, TorchProcessGroup]):
 
     def synchronize(self, device: Device) -> None:
         if device.type != DeviceType.CPU and torch.cuda.is_available():
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(device.index)
 
     def get_global_rank(self) -> int:
         if dist.is_available() and dist.is_initialized():

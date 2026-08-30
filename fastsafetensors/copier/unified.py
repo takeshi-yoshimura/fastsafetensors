@@ -124,6 +124,18 @@ class UnifiedMemCopier(CopierInterface):
         self._dma_thread: Optional[threading.Thread] = None
         self._dma_error: Optional[BaseException] = None
         self._dma_rc = 0
+        self._profile_readiness_calls = 0
+        self._profile_ready_calls = 0
+        self._profile_blocked_calls = 0
+        self._profile_submit_age_samples = 0
+        self._profile_submit_age_us = 0
+        self._profile_submit_age_max_us = 0
+        self._profile_waited_blocks = 0
+        self._profile_waited_bytes = 0
+        self._profile_activity_us = [0] * 8
+        self._profile_view_wait_calls = 0
+        self._profile_view_wait_us = 0
+        self._profile_readiness_printed = False
         # Worker count for the C++ O_DIRECT range reader (dma_load_runs). Single
         # -thread pin_memory is page-cache-bound (~2.5 GB/s); O_DIRECT threads
         # bypass the cache and drive NVMe queue depth. Falls back to pin_memory
@@ -143,6 +155,9 @@ class UnifiedMemCopier(CopierInterface):
         completion = self._dma_completion
         if completion is None:
             return
+        profile = os.environ.get("FASTSAFETENSORS_PROFILE") == "1"
+        if profile:
+            self._profile_readiness_calls += 1
         frame = self.metadata.tensors[tensor_name]
         start = self.metadata.header_length + frame.data_offsets[0]
         end = self.metadata.header_length + frame.data_offsets[1]
@@ -155,8 +170,44 @@ class UnifiedMemCopier(CopierInterface):
             if first == last
             else all(self._ready_blocks[first : last + 1])
         ):
+            if profile:
+                self._profile_ready_calls += 1
             return
-        rc = completion.wait_range(start, end)
+        if profile:
+            wait_range_profile = getattr(completion, "wait_range_profile", None)
+            if wait_range_profile is None:
+                wait_begin = time.perf_counter_ns()
+                rc = completion.wait_range(start, end)
+                self._profile_activity_us[1] += (
+                    time.perf_counter_ns() - wait_begin
+                ) // 1000
+                self._profile_blocked_calls += 1
+                self._profile_waited_bytes += end - start
+                self._profile_waited_blocks += last - first + 1
+                self._ready_blocks[first : last + 1] = b"\x01" * (last - first + 1)
+                if rc != 0:
+                    self.finish_io()
+                    raise RuntimeError(f"dma_load_runs failed with rc={rc}")
+                return
+            result = wait_range_profile(start, end)
+            rc = result[0]
+            submit_age_us = result[1]
+            ready_at_call = result[4] != 0
+            self._profile_submit_age_samples += 1
+            self._profile_submit_age_us += submit_age_us
+            self._profile_submit_age_max_us = max(
+                self._profile_submit_age_max_us, submit_age_us
+            )
+            if ready_at_call:
+                self._profile_ready_calls += 1
+            else:
+                self._profile_blocked_calls += 1
+                self._profile_waited_blocks += result[2]
+                self._profile_waited_bytes += end - start
+            for mask in range(1, 8):
+                self._profile_activity_us[mask] += result[5 + mask]
+        else:
+            rc = completion.wait_range(start, end)
         if rc != 0:
             self.finish_io()
             raise RuntimeError(f"dma_load_runs failed with rc={rc}")
@@ -183,6 +234,39 @@ class UnifiedMemCopier(CopierInterface):
             raise RuntimeError(f"dma_load_runs failed with rc={rc}")
         if materialize_error is not None:
             raise materialize_error
+        self._print_readiness_profile()
+
+    def _print_readiness_profile(self) -> None:
+        if (
+            self._profile_readiness_printed
+            or os.environ.get("FASTSAFETENSORS_PROFILE") != "1"
+            or self._profile_readiness_calls == 0
+        ):
+            return
+        self._profile_readiness_printed = True
+        activity = self._profile_activity_us
+        print(
+            f"[FST_PROFILE] readiness file={self.metadata.src} "
+            f"calls={self._profile_readiness_calls} "
+            f"ready={self._profile_ready_calls} "
+            f"blocked={self._profile_blocked_calls} "
+            f"submit_age_avg_ms="
+            f"{self._profile_submit_age_us / max(self._profile_submit_age_samples, 1) / 1000:.3f} "
+            f"submit_age_max_ms={self._profile_submit_age_max_us / 1000:.3f} "
+            f"waited_blocks={self._profile_waited_blocks} "
+            f"waited_bytes={self._profile_waited_bytes} "
+            f"queued_ms={activity[1] / 1000:.3f} "
+            f"pread_ms={activity[2] / 1000:.3f} "
+            f"queued_pread_ms={activity[3] / 1000:.3f} "
+            f"h2d_ms={activity[4] / 1000:.3f} "
+            f"queued_h2d_ms={activity[5] / 1000:.3f} "
+            f"pread_h2d_ms={activity[6] / 1000:.3f} "
+            f"queued_pread_h2d_ms={activity[7] / 1000:.3f} "
+            f"view_wait_calls={self._profile_view_wait_calls} "
+            f"view_wait_ms={self._profile_view_wait_us / 1000:.3f}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     def _start_progressive_materialization(
         self, gbuf: fstcpp.gds_device_buffer
@@ -389,7 +473,19 @@ class UnifiedMemCopier(CopierInterface):
                 device_id = self.device.index if self.device.index is not None else 0
             if self._tensor_readiness:
                 self._submit_path = "dma-stream"
-                self._dma_completion = fstcpp.dma_completion(base_off, starts, ends)
+                if profile:
+                    try:
+                        self._dma_completion = fstcpp.dma_completion(
+                            base_off, starts, ends, True
+                        )
+                    except TypeError:
+                        # Test doubles and extensions built before the profile
+                        # argument retain the original three-argument API.
+                        self._dma_completion = fstcpp.dma_completion(
+                            base_off, starts, ends
+                        )
+                else:
+                    self._dma_completion = fstcpp.dma_completion(base_off, starts, ends)
                 block_count = (max(ends) - base_off + (16 << 20) - 1) // (16 << 20)
                 self._ready_blocks = bytearray(block_count)
                 self._dma_error = None
@@ -494,7 +590,8 @@ class UnifiedMemCopier(CopierInterface):
                 f"dma_attempt_ms={dma_attempt_ms:.3f} pin_ms={pin_ms:.3f} "
                 f"copy_submit_ms={copy_submit_ms:.3f} "
                 f"total_ms={(submit_done - submit_begin) * 1000:.3f}",
-                file=sys.stderr, flush=True,
+                file=sys.stderr,
+                flush=True,
             )
 
         return gbuf
@@ -545,7 +642,8 @@ class UnifiedMemCopier(CopierInterface):
                 f"dlpack_worker_ms={self._materialize_ms:.3f} "
                 f"release_ms={(release_done - tensors_done) * 1000:.3f} "
                 f"total_ms={(release_done - wait_begin) * 1000:.3f}",
-                file=sys.stderr, flush=True,
+                file=sys.stderr,
+                flush=True,
             )
 
         return tensors
@@ -554,6 +652,8 @@ class UnifiedMemCopier(CopierInterface):
         self, tensor_name: str, gbuf: fstcpp.gds_device_buffer
     ) -> TensorBase:
         if self._progressive_materialization:
+            profile = os.environ.get("FASTSAFETENSORS_PROFILE") == "1"
+            wait_begin = time.perf_counter_ns() if profile else 0
             with self._materialize_condition:
                 while (
                     self._materialized is not None
@@ -563,14 +663,17 @@ class UnifiedMemCopier(CopierInterface):
                     and self._materialize_error is None
                 ):
                     self._materialize_condition.wait()
+            if profile:
+                wait_us = (time.perf_counter_ns() - wait_begin) // 1000
+                if wait_us > 0:
+                    self._profile_view_wait_calls += 1
+                    self._profile_view_wait_us += wait_us
             if self._materialize_error is not None:
                 raise self._materialize_error
             if self._materialized is not None and tensor_name in self._materialized:
                 return self._materialized[tensor_name]
             raise KeyError(f"tensor view was not materialized: {tensor_name}")
-        return self.metadata._get_tensor(
-            tensor_name, gbuf, self.device, self._base_off
-        )
+        return self.metadata._get_tensor(tensor_name, gbuf, self.device, self._base_off)
 
 
 def is_unified_memory_system(framework: Optional[FrameworkOpBase] = None) -> bool:

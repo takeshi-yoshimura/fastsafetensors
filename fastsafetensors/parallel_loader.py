@@ -584,7 +584,7 @@ class PipelineParallel:
                     if self.borrowed_tensors:
                         tensors = batch.fb.iter_local_tensors(batch.keys)
                     else:
-                        tensors = ((key, None) for key in batch.keys)
+                        tensors = batch.fb.iter_tensors(batch.keys)
                     for key, local_tensor in tensors:
                         tensor = (
                             local_tensor
@@ -602,7 +602,11 @@ class PipelineParallel:
                     if self.borrowed_tensors:
                         tensors = batch.fb.iter_local_tensors(batch.keys)
                     else:
-                        tensors = ((key, None) for key in batch.keys)
+                        # Profile the same run-broadcast path as normal loading.
+                        # Falling back to get_tensor() here would measure the
+                        # old per-tensor collective and make profile/non-profile
+                        # comparisons misleading.
+                        tensors = batch.fb.iter_tensors(batch.keys)
                     for key, local_tensor in tensors:
                         view_begin = time.perf_counter_ns()
                         tensor = (
