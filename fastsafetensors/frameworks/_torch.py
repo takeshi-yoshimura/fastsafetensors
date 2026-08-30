@@ -276,10 +276,25 @@ class TorchOp(FrameworkOpBase[TorchTensor, TorchProcessGroup]):
                     "broadcast byte run is not contiguous in device memory"
                 )
         first = tensors[0].real_tensor
-        byte_offset = first.data_ptr() - first.untyped_storage().data_ptr()
-        return torch.empty(0, dtype=torch.uint8, device=first.device).set_(
-            first.untyped_storage(), byte_offset, (sum(sizes),), (1,)
+        total_bytes = sum(sizes)
+        storage = first.untyped_storage()
+        byte_offset = first.data_ptr() - storage.data_ptr()
+        if byte_offset + total_bytes <= storage.nbytes():
+            return torch.empty(0, dtype=torch.uint8, device=first.device).set_(
+                storage, byte_offset, (total_bytes,), (1,)
+            )
+
+        # Tensors materialized independently through DLPack can point into one
+        # contiguous loader allocation while each PyTorch Storage describes
+        # only that tensor.  Extending the first non-resizable Storage with
+        # set_() then fails even though the address range itself is valid.
+        # Describe the already-validated contiguous byte span directly instead.
+        from ..dlpack import from_cuda_buffer
+
+        capsule = from_cuda_buffer(
+            first.data_ptr(), [total_bytes], [1], DType.U8, tensors[0].device
         )
+        return torch.from_dlpack(capsule)
 
     def _views_from_flat(
         self, flat: torch.Tensor, frames: List[Any], device: Device
