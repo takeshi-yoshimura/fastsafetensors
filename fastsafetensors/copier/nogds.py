@@ -119,11 +119,32 @@ class NoGdsFileCopier(CopierInterface):
         """Per in-flight-chunk transient cost, as a multiple of chunk span: 1.
 
         Reads land in the reader's fixed pool of host bounce buffers
-        (``bbuf_size_kb`` x ``max_threads``, sized independently of the chunk),
-        so the only device-side allocation that scales with a chunk is the
-        chunk buffer itself.
+        (``bbuf_size_kb`` total, sized independently of the chunk), so the only
+        device-side allocation that scales with a chunk is the chunk buffer
+        itself. See ``fixed_device_overhead`` for the pool.
         """
         return 1
+
+    @classmethod
+    def fixed_device_overhead(cls, paths: List[str]) -> int:
+        """Chunk-size-independent device cost: none.
+
+        The reader's bounce pool is host memory -- ``cudaHostAlloc`` of
+        ``bbuf_size_kb`` (a total, split across ``max_threads``; doubled in
+        async copy mode), see ``cpp/ext.cpp`` ``nogds_file_reader::submit_read``
+        -- so on a discrete GPU it never touches the device budget. The only
+        device-side residue of the worker pool is the CUDA context each thread
+        attaches to, which is left to the caller's allocator reserve.
+
+        This copier runs when the device is CPU, or when
+        ``is_unified_memory_system()`` is false (see
+        ``SafeTensorsFileLoader.__init__``) -- the unified-memory case, where a
+        pinned pool would draw on the same physical memory as the chunk buffer,
+        goes to ``UnifiedMemCopier`` instead. Forcing this copier onto such a
+        system with ``FASTSAFETENSORS_UNIFIED_MEM=0`` therefore under-charges
+        the budget by the pool's size, which that override accepts.
+        """
+        return 0
 
     def submit_io(
         self, use_buf_register: bool, max_copy_block_size: int

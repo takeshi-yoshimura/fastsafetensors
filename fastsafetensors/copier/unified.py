@@ -53,6 +53,15 @@ _NETWORK_FS = {
 }
 _warned_fs: set = set()
 
+_DMA_THREADS_ENV = "FASTSAFETENSORS_DMA_THREADS"
+_DMA_THREADS_DEFAULT = 8
+# The O_DIRECT reader's pinned bounce pool, mirrored from C++ so the fit planner
+# can charge it before any read happens: dma_load_runs hands each worker one
+# PIN_CHUNK buffer and pin_release only returns it to a free list, never frees
+# it, so the pool is a process-lifetime high-water mark of one buffer per
+# worker. See PIN_CHUNK and pin_acquire/pin_release in cpp/ext.cpp.
+_DMA_PIN_CHUNK = 16 << 20
+
 
 def _allocation_length(required: int) -> int:
     """Round transient buffers so PyTorch's allocator can reuse them.
@@ -71,6 +80,25 @@ def _allocation_length(required: int) -> int:
     return ((required + granularity - 1) // granularity) * granularity
 
 
+def _dma_threads_from_env() -> int:
+    return int(os.environ.get(_DMA_THREADS_ENV, str(_DMA_THREADS_DEFAULT)))
+
+
+def _dma_worker_count(nthreads: int) -> int:
+    """Workers ``dma_load_runs`` will actually spawn for *nthreads*.
+
+    Mirrors the clamp the C++ reader applies to its thread count (see
+    dma_load_runs in cpp/ext.cpp). The ``< 1`` branch is unreachable from the
+    class-level policy methods, which only ask once the reader path is known to
+    be in use, but it is kept so this stays a faithful mirror.
+    """
+    if nthreads < 1:
+        return 4
+    if nthreads > 32:
+        return 32
+    return nthreads
+
+
 def _odirect_ok(path: str) -> bool:
     override = os.environ.get("FASTSAFETENSORS_ODIRECT")
     if override is not None:
@@ -86,6 +114,21 @@ def _odirect_ok(path: str) -> bool:
             )
         return False
     return True
+
+
+def _odirect_reader_usable(paths: List[str]) -> bool:
+    """Whether ``submit_io`` will take the O_DIRECT reader path for *paths*.
+
+    The single source of truth for the class-level policy methods, which must
+    agree with each other: the reader path costs one chunk span plus a fixed
+    pinned pool, the mmap+pin fallback costs two spans and no pool. Mirrors
+    submit_io's own condition.
+    """
+    if getattr(fstcpp, "dma_load_runs", None) is None:
+        return False
+    if _dma_threads_from_env() <= 0:
+        return False
+    return all(_odirect_ok(p) for p in paths)
 
 
 class UnifiedMemCopier(CopierInterface):
@@ -140,7 +183,7 @@ class UnifiedMemCopier(CopierInterface):
         # -thread pin_memory is page-cache-bound (~2.5 GB/s); O_DIRECT threads
         # bypass the cache and drive NVMe queue depth. Falls back to pin_memory
         # if the reader is unavailable.
-        self._dma_threads = int(os.environ.get("FASTSAFETENSORS_DMA_THREADS", "8"))
+        self._dma_threads = _dma_threads_from_env()
 
     def enable_tensor_readiness(self) -> bool:
         """Allow tensor views to be consumed while O_DIRECT remains in flight."""
@@ -406,20 +449,37 @@ class UnifiedMemCopier(CopierInterface):
         """Per in-flight-chunk transient cost, as a multiple of chunk span.
 
         The O_DIRECT reader (dma_load_runs) reads runs straight into the device
-        buffer: each live chunk costs ~1x its span plus a small fixed thread
-        pool (measured +~150 MB on GB10 regardless of chunk size; not charged
-        here). The mmap+pin_memory fallback additionally pins the chunk's file
+        buffer: each live chunk costs ~1x its span, plus a thread pool that does
+        not scale with the chunk and so is charged by ``fixed_device_overhead``
+        instead. The mmap+pin_memory fallback additionally pins the chunk's file
         pages for the copy's lifetime; on unified-memory systems both draws
         come from one physical pool, so each live chunk costs ~2x its span.
         Mirrors submit_io's own path selection.
         """
-        if getattr(fstcpp, "dma_load_runs", None) is None:
-            return 2
-        if int(os.environ.get("FASTSAFETENSORS_DMA_THREADS", "8")) <= 0:
-            return 2
-        if any(not _odirect_ok(p) for p in paths):
-            return 2
-        return 1
+        return 1 if _odirect_reader_usable(paths) else 2
+
+    @classmethod
+    def fixed_device_overhead(cls, paths: List[str]) -> int:
+        """The O_DIRECT reader's pinned bounce pool, or 0 on the fallback path.
+
+        This copier is chosen for unified-memory systems, where pinned host
+        memory and the chunk buffer draw on one physical pool, so the reader's
+        pool is a real charge against the budget. It is a fixed
+        one-buffer-per-worker high-water mark, independent of chunk size and of
+        pipeline depth (``max_concurrent_producers`` is 1, so only one
+        ``dma_load_runs`` call is ever in flight).
+
+        The mmap+pin fallback allocates no such pool -- it pins each chunk's own
+        pages instead, which scales with the chunk and is already charged by
+        ``chunk_transient_multiplier`` returning 2. The two methods therefore
+        split on the same condition.
+
+        Thread stacks and the per-worker CUDA context are not counted; they are
+        small next to the pool and are left to the caller's allocator reserve.
+        """
+        if not _odirect_reader_usable(paths):
+            return 0
+        return _dma_worker_count(_dma_threads_from_env()) * _DMA_PIN_CHUNK
 
     def submit_io(
         self, use_buf_register: bool, max_copy_block_size: int

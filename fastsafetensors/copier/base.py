@@ -145,6 +145,33 @@ class CopierInterface(ABC):
             f"device_memory_budget."
         )
 
+    @classmethod
+    def fixed_device_overhead(cls, paths: List[str]) -> int:
+        """Device bytes this copier holds regardless of chunk size, in total,
+        when loading *paths*.
+
+        The companion to ``chunk_transient_multiplier``: that one scales with
+        each live chunk, this one does not. Reader thread pools and bounce
+        buffers are sized independently of the chunk, so they cannot be
+        expressed as a multiple of it -- but whether they draw on the device at
+        all is the copier's own business. A pinned host pool is free on a
+        discrete GPU and charged in full on a unified-memory system, and the
+        copier that will run already encodes which of the two it is.
+
+        ``ParallelLoader(device_memory_budget=...)`` subtracts this from the
+        budget before planning, so the caller's own reserve only has to cover
+        allocator rounding. Costs that scale with a chunk belong in
+        ``chunk_transient_multiplier`` instead; counting them here would size
+        them off the wrong quantity. Like ``chunk_transient_multiplier``, the
+        default refuses rather than guessing: chunking copiers override it.
+        """
+        raise NotImplementedError(
+            f"device_memory_budget needs a copier that overrides "
+            f"fixed_device_overhead; {cls.__name__} does not implement "
+            f"sub-file chunking. Use the nogds or unified copier, or unset "
+            f"device_memory_budget."
+        )
+
     @abstractmethod
     def submit_io(
         self, use_buf_register: bool, max_copy_block_size: int

@@ -43,12 +43,18 @@ allocations outside the copier pipeline, such as cloning a yielded view before
 its backing file buffer is closed.
 
 The budget itself is the caller's to choose -- only the caller knows what
-else will live on the device. A caller sizing it from free memory should
-keep a reserve for allocator rounding and the copier's fixed pools (5% or
-1 GiB, whichever is larger, is a reasonable starting point), e.g.::
+else will live on the device. The copier's fixed pools are not the caller's
+to size, though: ``ParallelLoader`` subtracts them from the budget itself
+(``CopierInterface.fixed_device_overhead``), because whether a pinned pool
+draws on the device at all depends on the copier that will run. What the
+caller still owes is a reserve for allocator rounding -- a proportional
+cushion, e.g.::
 
     free, _ = torch.cuda.mem_get_info(dev)
-    budget = free - max(free // 20, 1 << 30)
+    budget = free - max(free // 20, 256 << 20)
+
+Do not add the copier's pools to that reserve: it would charge them twice,
+and on a discrete GPU they are host memory that never touches the budget.
 
 and, under broadcast loading, all-reduce(MIN) that value before passing it:
 per-rank readings diverge, and differing budgets would give ranks different
@@ -192,9 +198,11 @@ def plan_file_budgets(
     (its reader path decides), so callers pass
     ``CopierInterface.chunk_transient_multiplier(paths)``. Fixed overheads
     that do not scale with chunk size -- bounce-buffer pools, the O_DIRECT
-    reader's thread pool (measured on GB10 unified memory: +~150 MB regardless
-    of chunk size) -- are not modelled here and must be left outside the
-    budget the caller passes.
+    reader's thread pool -- cannot be expressed as a multiple of the chunk and
+    are not modelled here; ``ParallelLoader`` deducts them from the budget
+    before calling this, via
+    ``CopierInterface.fixed_device_overhead(paths)``, so
+    ``device_memory_budget`` as seen here is already net of them.
 
     ``group_size`` is the number of files loaded concurrently, one per rank
     (``pg.size()`` under broadcast loading, 1 otherwise). Every rank ends up
@@ -228,8 +236,7 @@ def plan_file_budgets(
         raise ValueError(f"group_size must be >= 1, got {group_size}")
     if extra_transient_buffers < 0:
         raise ValueError(
-            "extra_transient_buffers must be >= 0, got "
-            f"{extra_transient_buffers}"
+            f"extra_transient_buffers must be >= 0, got {extra_transient_buffers}"
         )
     eff_depth = depth * transient_multiplier + extra_transient_buffers
     # Cumulative kept bytes through the end of each file's batch group. With

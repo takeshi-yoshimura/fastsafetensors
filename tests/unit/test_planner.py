@@ -51,6 +51,16 @@ def test_chunk_transient_multiplier_default_refuses():
             cls.chunk_transient_multiplier(["f0"])
 
 
+def test_fixed_device_overhead_default_refuses():
+    # Same stance as the multiplier: returning 0 would be a guess, and one that
+    # silently under-charges the budget on a unified-memory system.
+    from fastsafetensors.copier import CopierInterface, GdsFileCopier
+
+    for cls in (CopierInterface, GdsFileCopier):
+        with pytest.raises(NotImplementedError, match="fixed_device_overhead"):
+            cls.fixed_device_overhead(["f0"])
+
+
 def test_chunking_copiers_declare_their_transient_cost():
     # The two overrides have to travel together: a copier that implements
     # set_chunk but inherits the refusing default would be rejected by
@@ -68,21 +78,36 @@ def test_chunking_copiers_declare_their_transient_cost():
         cls = get_copier_class(name)
         assert cls is registered is not CopierInterface, name
         chunks = cls.set_chunk is not CopierInterface.set_chunk
-        # chunk_transient_multiplier is a classmethod: attribute access builds
-        # a fresh bound method every time, so compare the underlying functions.
+        # Both policy methods are classmethods: attribute access builds a fresh
+        # bound method every time, so compare the underlying functions.
         declares = (
             cls.chunk_transient_multiplier.__func__
             is not CopierInterface.chunk_transient_multiplier.__func__
+        )
+        declares_fixed = (
+            cls.fixed_device_overhead.__func__
+            is not CopierInterface.fixed_device_overhead.__func__
         )
         assert chunks == declares, (
             f"{name}: set_chunk override={chunks} but "
             f"chunk_transient_multiplier override={declares}"
         )
+        # The fixed overhead travels with the multiplier for the same reason:
+        # the planner asks for both, so declaring one without the other turns a
+        # chunk-capable copier into a NotImplementedError at plan time.
+        assert chunks == declares_fixed, (
+            f"{name}: set_chunk override={chunks} but "
+            f"fixed_device_overhead override={declares_fixed}"
+        )
         if declares:
             assert cls.chunk_transient_multiplier(["f0", "f1"]) >= 1
+            assert cls.fixed_device_overhead(["f0", "f1"]) >= 0
     # Exact, not just >= 1: silently bumping nogds to 2 would halve every
     # budget on the default CPU path without failing anything else.
     assert get_copier_class("nogds").chunk_transient_multiplier(["f0"]) == 1
+    # Exact for the same reason: nogds' pools are host memory, so charging the
+    # budget anything here would shrink every chunk on the default path.
+    assert get_copier_class("nogds").fixed_device_overhead(["f0"]) == 0
 
 
 def test_copier_class_follows_factory_fallback():
@@ -156,6 +181,49 @@ def test_chunk_transient_multiplier_unified_tracks_reader_path(monkeypatch):
     monkeypatch.setenv("FASTSAFETENSORS_DMA_THREADS", "8")
     monkeypatch.setenv("FASTSAFETENSORS_ODIRECT", "0")
     assert UnifiedMemCopier.chunk_transient_multiplier(["f0"]) == 2
+
+
+def test_fixed_device_overhead_unified_tracks_reader_path(monkeypatch):
+    # The complement of the multiplier: the reader path costs one span per live
+    # chunk plus this fixed pinned pool, the fallback costs two spans and no
+    # pool. The two must split on exactly the same condition or the plan
+    # charges a pool that was never allocated (or misses one that was).
+    from fastsafetensors.copier import UnifiedMemCopier
+    from fastsafetensors.copier.unified import _DMA_PIN_CHUNK
+
+    if getattr(fstcpp, "dma_load_runs", None) is None:
+        pytest.skip("built without the O_DIRECT reader; only the fallback exists")
+
+    monkeypatch.setenv("FASTSAFETENSORS_ODIRECT", "1")
+    monkeypatch.setenv("FASTSAFETENSORS_DMA_THREADS", "8")
+    # One 16 MiB pinned buffer per worker, never freed back to the driver.
+    assert UnifiedMemCopier.fixed_device_overhead(["f0"]) == 8 * _DMA_PIN_CHUNK
+    assert _DMA_PIN_CHUNK == 16 * MiB
+
+    # Reader disabled -> mmap+pin fallback allocates no pool; its per-chunk pin
+    # is charged by the multiplier instead.
+    monkeypatch.setenv("FASTSAFETENSORS_DMA_THREADS", "0")
+    assert UnifiedMemCopier.fixed_device_overhead(["f0"]) == 0
+
+    # Network filesystem -> reader skipped, so again no pool.
+    monkeypatch.setenv("FASTSAFETENSORS_DMA_THREADS", "8")
+    monkeypatch.setenv("FASTSAFETENSORS_ODIRECT", "0")
+    assert UnifiedMemCopier.fixed_device_overhead(["f0"]) == 0
+
+    # The pool is sized by the workers the C++ reader will actually spawn, so
+    # the clamp mirrored in Python has to match dma_load_runs' own.
+    monkeypatch.setenv("FASTSAFETENSORS_ODIRECT", "1")
+    monkeypatch.setenv("FASTSAFETENSORS_DMA_THREADS", "64")
+    assert UnifiedMemCopier.fixed_device_overhead(["f0"]) == 32 * _DMA_PIN_CHUNK
+    monkeypatch.setenv("FASTSAFETENSORS_DMA_THREADS", "1")
+    assert UnifiedMemCopier.fixed_device_overhead(["f0"]) == _DMA_PIN_CHUNK
+
+    # Independent of chunk count and of how many paths are being planned --
+    # that is what makes it a fixed cost rather than a multiplier.
+    monkeypatch.setenv("FASTSAFETENSORS_DMA_THREADS", "8")
+    assert UnifiedMemCopier.fixed_device_overhead(
+        ["f0", "f1", "f2"]
+    ) == UnifiedMemCopier.fixed_device_overhead(["f0"])
 
 
 # ---- planner math ----
@@ -515,6 +583,130 @@ def test_single_process_loader_budgets_yield_clone(
 
     assert pl.need_clone is not borrowed_tensors
     assert captured["extra_transient_buffers"] == expected_extra_buffers
+
+
+def _record_planned_budget(monkeypatch):
+    """Capture the budget the loader hands the planner.
+
+    device_memory_budget is positional, so record args, not just kwargs.
+    """
+    from fastsafetensors import _planner
+
+    seen = []
+    real_plan_file_budgets = _planner.plan_file_budgets
+
+    def record_plan(stats, device_memory_budget, *args, **kwargs):
+        seen.append(device_memory_budget)
+        return real_plan_file_budgets(stats, device_memory_budget, *args, **kwargs)
+
+    monkeypatch.setattr(_planner, "plan_file_budgets", record_plan)
+    return seen
+
+
+def test_loader_subtracts_copier_fixed_overhead(input_files, framework, monkeypatch):
+    # The caller passes what the device has; the loader nets out what only the
+    # copier knows it will hold. Charging this in the caller would mean
+    # guessing per platform, which is the bug this exists to prevent.
+    if framework.get_name() != "pytorch":
+        pytest.skip("pytorch-only integration test")
+
+    from fastsafetensors import ParallelLoader
+    from fastsafetensors.copier import NoGdsFileCopier
+
+    def _load(budget):
+        ParallelLoader(
+            pg=None,
+            hf_weights_files=[input_files[0]],
+            device="cpu",
+            nogds=True,
+            use_tqdm_on_load=False,
+            device_memory_budget=budget,
+            accumulate_resident=False,
+        )
+
+    # Default nogds path: pools are host memory, so the planner sees the budget
+    # untouched. A regression here silently shrinks every chunk on the common
+    # path, so assert the identity rather than just "<= budget".
+    seen = _record_planned_budget(monkeypatch)
+    _load(1 << 30)
+    assert seen == [1 << 30]
+
+    # A copier that does hold device memory has it deducted.
+    overhead = 128 * MiB
+    monkeypatch.setattr(
+        NoGdsFileCopier,
+        "fixed_device_overhead",
+        classmethod(lambda cls, paths: overhead),
+    )
+    seen = _record_planned_budget(monkeypatch)
+    _load(1 << 30)
+    assert seen == [(1 << 30) - overhead]
+
+
+def test_fixed_overhead_exceeding_budget_refused(input_files, framework, monkeypatch):
+    if framework.get_name() != "pytorch":
+        pytest.skip("pytorch-only integration test")
+
+    from fastsafetensors import ParallelLoader
+    from fastsafetensors.copier import NoGdsFileCopier
+
+    budget = 64 * MiB
+    monkeypatch.setattr(
+        NoGdsFileCopier,
+        "fixed_device_overhead",
+        classmethod(lambda cls, paths: budget),
+    )
+    # BudgetInfeasibleError subclasses ValueError, so match the message too --
+    # otherwise an unrelated ValueError would satisfy this.
+    with pytest.raises(BudgetInfeasibleError, match="fixed device overhead"):
+        ParallelLoader(
+            pg=None,
+            hf_weights_files=[input_files[0]],
+            device="cpu",
+            nogds=True,
+            use_tqdm_on_load=False,
+            device_memory_budget=budget,
+            accumulate_resident=False,
+        )
+
+
+def test_infeasible_message_accounts_for_fixed_overhead(
+    input_files, framework, monkeypatch
+):
+    # The planner only ever sees the net budget, so on its own it would report a
+    # number the caller never passed. Both have to appear or the gap between
+    # them is left to be guessed at.
+    if framework.get_name() != "pytorch":
+        pytest.skip("pytorch-only integration test")
+
+    from fastsafetensors import ParallelLoader
+    from fastsafetensors.copier import NoGdsFileCopier
+
+    meta = SafeTensorsMetadata.from_file(input_files[0], framework)
+    (st,) = collect_file_stats([(input_files[0], meta)])
+    overhead = st.largest_tensor
+    # Feasible on its own, infeasible once the overhead comes off the top.
+    budget = pipeline_depth(0) * st.largest_tensor + overhead
+    monkeypatch.setattr(
+        NoGdsFileCopier,
+        "fixed_device_overhead",
+        classmethod(lambda cls, paths: overhead),
+    )
+
+    with pytest.raises(BudgetInfeasibleError) as ei:
+        ParallelLoader(
+            pg=None,
+            hf_weights_files=[input_files[0]],
+            device="cpu",
+            nogds=True,
+            use_tqdm_on_load=False,
+            device_memory_budget=budget,
+            accumulate_resident=False,
+        )
+    msg = str(ei.value)
+    assert str(budget) in msg, msg
+    assert str(overhead) in msg, msg
+    assert "NoGdsFileCopier" in msg, msg
 
 
 def test_borrowed_tensors_bypass_generic_get_tensor(

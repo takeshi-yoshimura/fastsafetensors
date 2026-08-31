@@ -199,12 +199,15 @@ class PipelineParallel:
             )
         self.fixed_batch_buffer = fixed_batch_buffer
         # When set (bytes), bound the load's TOTAL device footprint (resident
-        # tensors + transient buffers) via a static fit plan: whole-file loads
-        # while headroom is ample, per-file chunk budgets declining as the
-        # device fills. The caller picks the number -- it knows what else lives
-        # on the device and, under broadcast loading, must pass the same value
-        # on every rank (e.g. all-reduce(MIN) of each rank's free memory) so
-        # the plan stays identical across ranks. See fastsafetensors._planner.
+        # tensors + transient buffers + the copier's fixed pools) via a static
+        # fit plan: whole-file loads while headroom is ample, per-file chunk
+        # budgets declining as the device fills. The caller picks the number --
+        # it knows what else lives on the device and, under broadcast loading,
+        # must pass the same value on every rank (e.g. all-reduce(MIN) of each
+        # rank's free memory) so the plan stays identical across ranks. The
+        # copier's chunk-size-independent pools are subtracted from it here
+        # (CopierInterface.fixed_device_overhead), so the caller's own reserve
+        # only has to cover allocator rounding. See fastsafetensors._planner.
         self.device_memory_budget = device_memory_budget
         # True: the consumer keeps every yielded tensor (resident grows by
         # cumulative kept bytes). False: tensors are copied into preallocated
@@ -228,6 +231,14 @@ class PipelineParallel:
         # the caller explicitly accepts the borrowed-tensor lifetime contract.
         self.need_clone = pg.size() == 1 and not borrowed_tensors
 
+        # Logging setup - get from environment variable, default to False.
+        # Before _create_batches, which logs the fit plan it builds.
+        self.print_log = (
+            os.getenv("FASTSAFETENSORS_DEBUG", "false").lower() == "true"
+            or os.getenv("FASTSAFETENSORS_PROFILE") == "1"
+        )
+        self.log_prefix = f"PG{pg.rank() if pg is not None else 0}"
+
         # Batch files (or, with max_batch_bytes / device_memory_budget,
         # sub-file chunk-batches)
         self.weight_files_batches = self._create_batches(pg)
@@ -248,13 +259,6 @@ class PipelineParallel:
         )
         if queue_size <= 0 and self.consumer_processed is not None:
             self.consumer_processed.set()  # Initially set to allow first production
-
-        # Logging setup - get from environment variable, default to False
-        self.print_log = (
-            os.getenv("FASTSAFETENSORS_DEBUG", "false").lower() == "true"
-            or os.getenv("FASTSAFETENSORS_PROFILE") == "1"
-        )
-        self.log_prefix = f"PG{pg.rank() if pg is not None else 0}"
 
         fstcpp.set_gil_release(True)
 
@@ -295,6 +299,7 @@ class PipelineParallel:
         per_file_budget: Optional[Dict[str, int]] = None
         if self.device_memory_budget is not None:
             from ._planner import (
+                BudgetInfeasibleError,
                 collect_file_stats,
                 pipeline_depth,
                 plan_file_budgets,
@@ -314,22 +319,57 @@ class PipelineParallel:
             # tensor-sized transient allocation. A tensor cannot exceed its
             # containing chunk, so one extra buffer is a safe bound.
             clone_buffers = int(self.need_clone and not self.accumulate_resident)
-            # How much transient device memory a live chunk costs is the
-            # copier's own business (e.g. the unified copier's mmap+pin
-            # fallback pins the chunk's pages alongside the device buffer,
-            # costing 2x span on a shared physical pool), so ask it.
+            # How much device memory a live chunk costs, and how much the
+            # copier holds no matter the chunk size, are both the copier's own
+            # business (e.g. the unified copier's mmap+pin fallback pins the
+            # chunk's pages alongside the device buffer, costing 2x span on a
+            # shared physical pool, while its O_DIRECT reader instead keeps a
+            # fixed pinned pool), so ask it for both.
             copier = self.loader.copier_class
-            multiplier = copier.chunk_transient_multiplier([f for f, _ in metas])
-            budgets = plan_file_budgets(
-                collect_file_stats(metas, keep),
-                self.device_memory_budget,
-                depth,
-                max_batch_bytes=self.max_batch_bytes,
-                accumulate_resident=self.accumulate_resident,
-                transient_multiplier=multiplier,
-                group_size=batch_size,
-                extra_transient_buffers=clone_buffers,
+            paths = [f for f, _ in metas]
+            multiplier = copier.chunk_transient_multiplier(paths)
+            # Charged here rather than left to the caller: only the copier knows
+            # whether its pools land on the device, and a caller that guessed
+            # would have to guess per platform. What remains for the caller is
+            # allocator rounding.
+            fixed_overhead = copier.fixed_device_overhead(paths)
+            effective_budget = self.device_memory_budget - fixed_overhead
+            if effective_budget <= 0:
+                raise BudgetInfeasibleError(
+                    f"device_memory_budget={self.device_memory_budget} does not "
+                    f"cover {copier.__name__}'s fixed device overhead of "
+                    f"{fixed_overhead} bytes, leaving nothing to load with. "
+                    f"Free device memory or pass a larger budget."
+                )
+            self._log_message(
+                f"fit plan: budget={self.device_memory_budget}, "
+                f"{copier.__name__} fixed overhead={fixed_overhead}, "
+                f"effective={effective_budget}, depth={depth}, "
+                f"transient multiplier={multiplier}, "
+                f"extra buffers={clone_buffers}"
             )
+            try:
+                budgets = plan_file_budgets(
+                    collect_file_stats(metas, keep),
+                    effective_budget,
+                    depth,
+                    max_batch_bytes=self.max_batch_bytes,
+                    accumulate_resident=self.accumulate_resident,
+                    transient_multiplier=multiplier,
+                    group_size=batch_size,
+                    extra_transient_buffers=clone_buffers,
+                )
+            except BudgetInfeasibleError as e:
+                if not fixed_overhead:
+                    raise
+                # The planner only saw the effective budget, so its message
+                # names a number the caller never passed. Say where the rest
+                # went rather than leaving that gap to be guessed at.
+                raise BudgetInfeasibleError(
+                    f"{e} (the budget passed was "
+                    f"{self.device_memory_budget}, less {fixed_overhead} bytes "
+                    f"of fixed {copier.__name__} device overhead)"
+                ) from e
             per_file_budget = {f: b for (f, _), b in zip(metas, budgets)}
             meta_by_path = dict(metas)
 
