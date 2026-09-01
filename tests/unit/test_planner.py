@@ -11,6 +11,8 @@ from fastsafetensors._planner import (
     BudgetInfeasibleError,
     FileWeightStats,
     collect_file_stats,
+    fit_queue_size,
+    load_depth,
     pipeline_depth,
     plan_file_budgets,
 )
@@ -36,6 +38,15 @@ def test_pipeline_depth_mapping():
     assert pipeline_depth(0) == 2
     assert pipeline_depth(1) == 3
     assert pipeline_depth(4) == 6
+
+
+def test_load_depth_adds_the_broadcast_receive_buffer():
+    # Single rank: no broadcast, no receive tensor.
+    assert [load_depth(q) for q in (-1, 0, 2)] == [1, 2, 4]
+    # group_size > 1 costs exactly one more buffer, whatever the group width --
+    # ranks receive one file at a time, so the term must not scale with size.
+    for group in (2, 4, 8):
+        assert [load_depth(q, group) for q in (-1, 0, 2)] == [2, 3, 5]
 
 
 # ---- copier-supplied transient multiplier ----
@@ -245,6 +256,135 @@ def test_infeasible_raises_with_details():
     assert "queue_size" in msg
 
 
+# ---- inverting the bound: the deepest queue size that fits ----
+
+
+def test_fit_queue_size_leaves_a_feasible_request_alone():
+    stats = [_st(f"f{i}", 8 * GiB, largest=1 * GiB) for i in range(6)]
+    # 12 GiB / 1 GiB largest admits eff_depth 12, far more than qs=2 needs.
+    assert fit_queue_size(2, stats, 12 * GiB, accumulate_resident=False) == 2
+    # Clamping must never deepen a request: a caller asking for serial gets it.
+    assert fit_queue_size(-1, stats, 12 * GiB, accumulate_resident=False) == -1
+
+
+def test_fit_queue_size_clamps_to_the_deepest_feasible_depth():
+    # One unsplittable 2 GiB tensor per file against a 9 GiB budget: eff_depth
+    # is capped at 4, so pipeline_depth <= 4 and queue_size <= 2.
+    stats = [_st(f"f{i}", 6 * GiB, largest=2 * GiB) for i in range(4)]
+    assert fit_queue_size(8, stats, 9 * GiB, accumulate_resident=False) == 2
+    # The broadcast receive buffer takes one depth unit out of the same cap.
+    assert (
+        fit_queue_size(8, stats, 9 * GiB, accumulate_resident=False, group_size=2) == 1
+    )
+    # As does the yield clone, and the multiplier scales the whole pipeline.
+    assert (
+        fit_queue_size(
+            8, stats, 9 * GiB, accumulate_resident=False, account_for_yield_clone=True
+        )
+        == 1
+    )
+    assert (
+        fit_queue_size(
+            8, stats, 9 * GiB, accumulate_resident=False, transient_multiplier=2
+        )
+        == 0
+    )
+
+
+def test_fit_queue_size_is_exactly_maximal():
+    stats = [_st(f"f{i}", 6 * GiB, largest=2 * GiB) for i in range(4)]
+    fitted = fit_queue_size(8, stats, 9 * GiB, accumulate_resident=False)
+    # Not just "small enough": the returned depth plans, one deeper does not.
+    plan_file_budgets(stats, 9 * GiB, load_depth(fitted), accumulate_resident=False)
+    with pytest.raises(BudgetInfeasibleError):
+        plan_file_budgets(
+            stats, 9 * GiB, load_depth(fitted + 1), accumulate_resident=False
+        )
+
+
+def test_fit_queue_size_none_when_no_depth_helps():
+    # A tensor larger than the whole budget: serial does not fit either, so
+    # there is no queue size to fall back to and the caller must be told so
+    # rather than handed -1 and an OOM a few seconds later.
+    assert fit_queue_size(4, [_st("f0", 4 * GiB, largest=3 * GiB)], 2 * GiB) is None
+    assert fit_queue_size(4, [_st("f0", 1)], 0) is None
+    # Resident growth can exhaust the budget partway through even when every
+    # individual tensor is small.
+    stats = [_st(f"f{i}", 2 * GiB, largest=1 * GiB) for i in range(10)]
+    assert fit_queue_size(0, stats, 12 * GiB) is None
+
+
+def test_fit_queue_size_none_when_max_batch_bytes_binds():
+    # min(b, max_batch_bytes) floors the chunk budget below the atomic tensor
+    # no matter how shallow the pipeline, so no queue size can rescue this.
+    stats = [_st("f0", 4 * GiB, largest=2 * GiB)]
+    assert (
+        fit_queue_size(
+            4, stats, 100 * GiB, max_batch_bytes=1 * GiB, accumulate_resident=False
+        )
+        is None
+    )
+    # Just above the largest tensor it stops binding and the budget rules again.
+    assert (
+        fit_queue_size(
+            4, stats, 100 * GiB, max_batch_bytes=2 * GiB, accumulate_resident=False
+        )
+        == 4
+    )
+
+
+def test_fit_queue_size_unconstrained_when_nothing_is_kept():
+    # An all-filtered load has no chunk to size: the request passes through
+    # rather than being reported infeasible.
+    stats = [FileWeightStats(f"f{i}", 0, 0, 0) for i in range(3)]
+    assert fit_queue_size(3, stats, 1 * GiB) == 3
+
+
+def test_infeasible_message_names_the_queue_size_to_retry_with():
+    # The single-tensor shard case: Qwen3.8-27B keeps embed_tokens in a shard
+    # of its own, so that file's chunk floor is the whole 2.37 GiB tensor and
+    # a depth-5 pipeline overflows an 11.1 GiB budget by 6%. Telling the user
+    # only that it does not fit leaves them to invert the bound by hand.
+    emb = 2542796800
+    budget = 11962744832
+    stats = [_st(f"f{i}", emb, largest=emb) for i in range(4)]
+    with pytest.raises(BudgetInfeasibleError) as ei:
+        plan_file_budgets(
+            stats, budget, load_depth(2, 2), accumulate_resident=False, group_size=2
+        )
+    msg = str(ei.value)
+    assert "queue_size <= 1" in msg, msg
+    assert "currently 2" in msg, msg
+    # And the suggestion has to be true, not decorative.
+    plan_file_budgets(
+        stats, budget, load_depth(1, 2), accumulate_resident=False, group_size=2
+    )
+
+
+def test_infeasible_message_says_when_no_queue_size_helps():
+    stats = [_st("f0", 4 * GiB, largest=3 * GiB)]
+    with pytest.raises(BudgetInfeasibleError) as ei:
+        plan_file_budgets(stats, 2 * GiB, depth=1)
+    msg = str(ei.value)
+    assert "No queue_size fits" in msg, msg
+    assert str(3 * GiB) in msg, msg
+
+
+def test_max_batch_bytes_floor_is_reported_as_its_own_cause():
+    # Blaming the budget here would send the user to free device memory, which
+    # cannot help: the cap, not the budget, is what the tensor does not fit.
+    stats = [_st("f0", 4 * GiB, largest=2 * GiB)]
+    with pytest.raises(BudgetInfeasibleError, match="max_batch_bytes") as ei:
+        plan_file_budgets(
+            stats,
+            100 * GiB,
+            depth=1,
+            max_batch_bytes=1 * GiB,
+            accumulate_resident=False,
+        )
+    assert str(2 * GiB) in str(ei.value)
+
+
 def test_nonpositive_budget_and_bad_depth():
     with pytest.raises(BudgetInfeasibleError):
         plan_file_budgets([_st("f", 1)], 0, depth=1)
@@ -322,7 +462,7 @@ def _simulate_peak(
 def test_simulation_peak_within_budget():
     rng = random.Random(1234)
     trials = 400
-    multi_chunk = infeasible = grouped = 0
+    multi_chunk = infeasible = grouped = clamped = 0
     for trial in range(trials):
         n = rng.randint(1, 12)
         stats = []
@@ -360,7 +500,52 @@ def test_simulation_peak_within_budget():
             )
         except BudgetInfeasibleError:
             infeasible += 1
+            # The inverse has to agree with the plan on every refused case: it
+            # may not claim this queue size fits, and whatever it falls back to
+            # must actually plan -- with nothing deeper that would have. A
+            # clamp that is merely conservative would silently cost throughput
+            # on every load, and one that is optimistic reintroduces the OOM.
+            fitted = fit_queue_size(
+                qs,
+                stats,
+                budget,
+                accumulate_resident=acc,
+                transient_multiplier=mult,
+                group_size=group_size,
+            )
+            assert fitted is None or fitted < qs, (trial, fitted, qs)
+            if fitted is not None:
+                plan_file_budgets(
+                    stats,
+                    budget,
+                    load_depth(fitted, group_size),
+                    accumulate_resident=acc,
+                    transient_multiplier=mult,
+                    group_size=group_size,
+                )
+                clamped += 1
+                with pytest.raises(BudgetInfeasibleError):
+                    plan_file_budgets(
+                        stats,
+                        budget,
+                        load_depth(fitted + 1, group_size),
+                        accumulate_resident=acc,
+                        transient_multiplier=mult,
+                        group_size=group_size,
+                    )
             continue
+        # Feasible: the inverse must leave the request untouched.
+        assert (
+            fit_queue_size(
+                qs,
+                stats,
+                budget,
+                accumulate_resident=acc,
+                transient_multiplier=mult,
+                group_size=group_size,
+            )
+            == qs
+        ), (trial, qs)
         assert all(b >= st.largest_tensor for b, st in zip(budgets, stats))
         if any(
             len(_chunk_sizes(st.span_bytes, b)) >= 3 for st, b in zip(stats, budgets)
@@ -387,6 +572,9 @@ def test_simulation_peak_within_budget():
     assert multi_chunk > 40, f"only {multi_chunk}/{trials} trials split a file 3+ ways"
     assert infeasible > 20, f"only {infeasible}/{trials} trials hit the budget floor"
     assert grouped > 40, f"only {grouped}/{trials} trials used multi-rank groups"
+    # A refusal that no shallower pipeline can rescue exercises fit_queue_size'
+    # None path only; the clamp path is the one that has to be exactly maximal.
+    assert clamped > 10, f"only {clamped}/{trials} trials clamped to a feasible depth"
 
 
 # ---- collect_file_stats on real files ----

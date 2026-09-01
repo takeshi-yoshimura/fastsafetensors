@@ -261,19 +261,19 @@ class PipelineParallel:
         if self.device_memory_budget is not None:
             from ._planner import (
                 collect_file_stats,
-                pipeline_depth,
+                load_depth,
                 plan_file_budgets,
             )
 
             metas = [
                 (f, SafeTensorsMetadata.from_file(f, fw)) for f in self.hf_weights_files
             ]
-            # Broadcast mode adds one in-flight receive tensor (<= one chunk
-            # budget) on top of the live gbufs; the caller passing the same
-            # budget on every rank keeps the plan deterministic across ranks.
-            # batch_size also sets the group width: those files load together,
-            # one per rank, and every rank keeps all of them.
-            depth = pipeline_depth(self.queue_size) + (1 if batch_size > 1 else 0)
+            # load_depth adds broadcast mode's one in-flight receive tensor
+            # (<= one chunk budget) on top of the live gbufs; the caller passing
+            # the same budget on every rank keeps the plan deterministic across
+            # ranks. batch_size also sets the group width: those files load
+            # together, one per rank, and every rank keeps all of them.
+            depth = load_depth(self.queue_size, batch_size)
             account_for_yield_clone = self.need_clone and not self.accumulate_resident
             # How much transient device memory a live chunk costs is the
             # copier's own business (e.g. the unified copier's mmap+pin

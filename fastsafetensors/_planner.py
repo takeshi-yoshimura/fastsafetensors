@@ -40,6 +40,11 @@ any one rank,
 With ``group_size == 1``, ``G(i) == i`` and this reduces to ``R[i+1]``.
 ``yield_clone`` is 1 when a non-resident yielded tensor is cloned, else 0.
 
+``fit_queue_size`` inverts this bound: given a budget it returns the deepest
+queue size whose plan still fits, so a caller can clamp its pipeline depth to
+what the device affords instead of failing the load. The inversion is exact
+and needs no trial loads -- every term is known from the safetensors headers.
+
 The budget itself is the caller's to choose -- only the caller knows what
 else will live on the device. A caller sizing it from free memory should
 keep a reserve for allocator rounding and the copier's fixed pools (5% or
@@ -142,6 +147,36 @@ def pipeline_depth(queue_size: int) -> int:
     return queue_size + 2
 
 
+def load_depth(queue_size: int, group_size: int = 1) -> int:
+    """Concurrently live device buffers for a queue size and group width.
+
+    ``pipeline_depth`` counts the producer/consumer buffers; broadcast loading
+    (``group_size > 1``) adds one more for the in-flight receive tensor. This
+    is the ``depth`` that ``plan_file_budgets`` expects, and ``fit_queue_size``
+    inverts exactly this function -- both live here so a change to the
+    broadcast term cannot make a plan and its suggested queue size disagree.
+    """
+    return pipeline_depth(queue_size) + (1 if group_size > 1 else 0)
+
+
+def _queue_size_of_depth(depth: int, group_size: int = 1) -> int:
+    """Inverse of ``load_depth``.
+
+    Not injective at the bottom -- ``queue_size=-1`` and no queue at all both
+    give base depth 1 -- so base depth 1 maps back to -1 and anything deeper
+    to ``base - 2``.
+    """
+    base = depth - (1 if group_size > 1 else 0)
+    return -1 if base <= 1 else base - 2
+
+
+def _effective_depth(
+    depth: int, transient_multiplier: int, account_for_yield_clone: bool
+) -> int:
+    """Live transient buffers, each charged one chunk budget."""
+    return depth * transient_multiplier + int(account_for_yield_clone)
+
+
 def collect_file_stats(
     metas: List[Tuple[str, SafeTensorsMetadata]],
     keep_tensor: Optional[Callable[[str], bool]] = None,
@@ -164,6 +199,23 @@ def collect_file_stats(
             FileWeightStats(path, kept, span_end - span_start if kept else 0, largest)
         )
     return stats
+
+
+def _group_resident(stats: List[FileWeightStats], group_size: int) -> List[int]:
+    """Cumulative kept bytes through the end of each file's batch group.
+
+    With ``group_size == 1`` this is just ``R[i+1]``; under broadcast the whole
+    group is in flight at once, so every file in it is charged the group total.
+    """
+    kept_through_group = []
+    running = 0
+    for st in stats:
+        running += st.kept_bytes
+        kept_through_group.append(running)
+    return [
+        kept_through_group[min((i // group_size + 1) * group_size, len(stats)) - 1]
+        for i in range(len(stats))
+    ]
 
 
 def plan_file_budgets(
@@ -221,19 +273,8 @@ def plan_file_budgets(
         )
     if group_size < 1:
         raise ValueError(f"group_size must be >= 1, got {group_size}")
-    eff_depth = depth * transient_multiplier + int(account_for_yield_clone)
-    # Cumulative kept bytes through the end of each file's batch group. With
-    # group_size == 1 this is just R[i+1]; under broadcast the whole group is
-    # in flight at once, so every file in it is charged the group's total.
-    kept_through_group = []
-    running = 0
-    for end in range(len(stats)):
-        running += stats[end].kept_bytes
-        kept_through_group.append(running)
-    group_resident = [
-        kept_through_group[min((i // group_size + 1) * group_size, len(stats)) - 1]
-        for i in range(len(stats))
-    ]
+    eff_depth = _effective_depth(depth, transient_multiplier, account_for_yield_clone)
+    group_resident = _group_resident(stats, group_size)
     budgets = []
     for i, st in enumerate(stats):
         resident = group_resident[i] if accumulate_resident else 0
@@ -241,13 +282,128 @@ def plan_file_budgets(
         if max_batch_bytes is not None:
             b = min(b, max_batch_bytes)
         if b < st.largest_tensor:
+            if max_batch_bytes is not None and max_batch_bytes < st.largest_tensor:
+                # The cap binds before the budget does. Blaming the budget here
+                # sends the user to free device memory, which cannot help: a
+                # tensor is the atomic load unit, so no depth and no budget
+                # make it fit a chunk smaller than itself.
+                raise BudgetInfeasibleError(
+                    f"max_batch_bytes={max_batch_bytes} is smaller than the "
+                    f"largest kept tensor of '{st.path}' "
+                    f"({st.largest_tensor} bytes); a tensor is the atomic load "
+                    f"unit, so no queue_size or budget can fit it. Raise "
+                    f"max_batch_bytes to at least {st.largest_tensor}."
+                )
             required = resident + eff_depth * st.largest_tensor
+            # Say what to retry with rather than only that something is too
+            # big: the fix is a number the caller cannot get from the message
+            # otherwise, and it is exactly computable here.
+            requested_qs = _queue_size_of_depth(depth, group_size)
+            fitted = fit_queue_size(
+                requested_qs,
+                stats,
+                device_memory_budget,
+                max_batch_bytes=max_batch_bytes,
+                accumulate_resident=accumulate_resident,
+                transient_multiplier=transient_multiplier,
+                group_size=group_size,
+                account_for_yield_clone=account_for_yield_clone,
+            )
+            if fitted is not None and fitted < requested_qs:
+                advice = (
+                    f"Retry with queue_size <= {fitted} (currently "
+                    f"{requested_qs}), free device memory, or pass a larger "
+                    f"explicit budget."
+                )
+            else:
+                serial = (
+                    resident
+                    + _effective_depth(
+                        load_depth(-1, group_size),
+                        transient_multiplier,
+                        account_for_yield_clone,
+                    )
+                    * st.largest_tensor
+                )
+                advice = (
+                    f"No queue_size fits: even a fully serial load "
+                    f"(queue_size=-1) needs >= {serial} bytes for this file. "
+                    f"Free device memory or pass a larger explicit budget."
+                )
             raise BudgetInfeasibleError(
                 f"Model does not fit device_memory_budget: loading '{st.path}' "
                 f"needs >= {required} bytes ({resident} resident + {eff_depth} x "
                 f"{st.largest_tensor} transient), budget is {device_memory_budget}. "
-                f"Reduce pipeline depth (queue_size), free device memory, or pass "
-                f"a larger explicit budget."
+                + advice
             )
         budgets.append(b)
     return budgets
+
+
+def fit_queue_size(
+    requested: int,
+    stats: List[FileWeightStats],
+    device_memory_budget: int,
+    max_batch_bytes: Optional[int] = None,
+    accumulate_resident: bool = True,
+    transient_multiplier: int = 1,
+    group_size: int = 1,
+    account_for_yield_clone: bool = False,
+) -> Optional[int]:
+    """The deepest queue size ``<= requested`` whose plan fits the budget.
+
+    Returns *requested* unchanged when it already fits, a smaller queue size
+    when the budget only admits a shallower pipeline, and ``None`` when no
+    queue size fits -- some file's largest tensor overflows the budget even
+    loaded serially, so only freeing device memory (or a larger budget) helps.
+
+    This is the exact inverse of the bound ``plan_file_budgets`` enforces, not
+    a search: a plan with the returned queue size is guaranteed not to raise,
+    and, whenever the result is smaller than *requested*, a plan one deeper
+    than the result is guaranteed to raise.
+    Every input comes from safetensors headers, so no trial load is needed --
+    which is the point, since a trial load costs the whole model's bytes and
+    a warm page cache would make repeated trials incomparable anyway.
+
+    Callers pass the same arguments they would pass to ``plan_file_budgets``,
+    minus ``depth``: that is what is being solved for. Under broadcast loading
+    every rank must pass the same budget (see the module docstring), which then
+    makes the clamp identical across ranks and keeps the plans in lockstep.
+    """
+    if transient_multiplier < 1:
+        raise ValueError(
+            f"transient_multiplier must be >= 1, got {transient_multiplier}"
+        )
+    if group_size < 1:
+        raise ValueError(f"group_size must be >= 1, got {group_size}")
+    if device_memory_budget <= 0:
+        return None
+    group_resident = _group_resident(stats, group_size)
+    # Largest eff_depth every file can still afford. The plan's own test,
+    # (budget - resident) // eff_depth >= largest, is exactly
+    # budget - resident >= largest * eff_depth for eff_depth >= 1, so the
+    # constraint inverts with no floor-division slack in either direction.
+    cap = None  # None: no kept tensor constrains the depth
+    for i, st in enumerate(stats):
+        if st.largest_tensor <= 0:
+            continue  # nothing kept in this file: no chunk, no constraint
+        if max_batch_bytes is not None and max_batch_bytes < st.largest_tensor:
+            return None  # the cap binds before the budget; depth cannot help
+        headroom = device_memory_budget - (
+            group_resident[i] if accumulate_resident else 0
+        )
+        if headroom < st.largest_tensor:
+            return None
+        limit = headroom // st.largest_tensor
+        cap = limit if cap is None else min(cap, limit)
+    if cap is None:
+        return requested
+    # eff_depth = load_depth * multiplier + clone <= cap, solved for the
+    # pipeline_depth term, then mapped back through load_depth's inverse.
+    room = cap - int(account_for_yield_clone)
+    if room < transient_multiplier:
+        return None  # not even one live buffer fits alongside the clone
+    max_base = room // transient_multiplier - (1 if group_size > 1 else 0)
+    if max_base < 1:
+        return None
+    return min(requested, -1 if max_base == 1 else max_base - 2)

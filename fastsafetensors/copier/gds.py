@@ -253,6 +253,13 @@ def new_gds_file_copier(
                 UserWarning,
             )
 
+    # dlopen the GPU runtime (and libcufile) before probing for them. This is
+    # what makes is_gpu_found(), is_cufile_found() and is_gds_supported() below
+    # meaningful; init_gds() would do it too, but only after those probes. Note
+    # this loads libcufile without calling cuFileDriverOpen(), so it is safe on
+    # the half-configured hosts guarded against above.
+    load_library_func(kwargs.get("framework"))
+
     device_is_not_cpu = device.type != DeviceType.CPU
     if device_is_not_cpu and not is_gpu_found():
         raise Exception(
