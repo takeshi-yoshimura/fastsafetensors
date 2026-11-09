@@ -2,12 +2,21 @@
 
 import operator
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    ClassVar,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+)
 
 from .. import cpp as fstcpp
 from ..common import SafeTensorsMetadata
 from ..frameworks import TensorBase
-from ..st_types import DType
+from ..st_types import Device, DeviceType, DType
 
 if TYPE_CHECKING:
     from ..allocation import SharedDeviceAllocation
@@ -89,6 +98,16 @@ def validated_chunk_allocation_size(
     return allocation_size
 
 
+def reject_spyre_device(device: Device, copier_type: str) -> None:
+    """Byte copiers DMA a file into one buffer and view tensors in it, which
+    Spyre's own tensor format does not allow."""
+    if device.type == DeviceType.SPYRE:
+        raise ValueError(
+            f"copier '{copier_type}' cannot load onto Spyre device "
+            f"'{device.as_str()}'; use its device-native copier (copier_type=...)"
+        )
+
+
 class CopierInterface(ABC):
     metadata: SafeTensorsMetadata
 
@@ -111,6 +130,23 @@ class CopierInterface(ABC):
 
     def finish_io(self) -> None:
         """Drain all inflight writes before buffer or file descriptor release."""
+
+    # The tensors wait_io returns own their storage instead of viewing the gbuf,
+    # so they outlive FilesBufferOnDevice.close() and need no clone on yield.
+    owns_tensor_storage: ClassVar[bool] = False
+    # The tensors are in an opaque device-specific format (e.g. Spyre's
+    # layout): no slicing, dtype conversion or collectives may touch them.
+    # Implies owns_tensor_storage.
+    device_native: ClassVar[bool] = False
+
+    def select_tensors(self, keep: Callable[[str], bool]) -> None:
+        """Load only the tensors ``keep`` accepts.
+
+        The default reads the byte runs covering them (``set_byte_ranges``),
+        which may include neighbours; copiers that need the exact names (e.g.
+        to allocate one destination per tensor) override this.
+        """
+        self.set_byte_ranges(self.metadata.select_byte_ranges(keep))
 
     def set_byte_ranges(self, byte_ranges: Optional[List[Tuple[int, int]]]) -> None:
         """Restrict reads to these ``[start, end)`` absolute file-offset runs.

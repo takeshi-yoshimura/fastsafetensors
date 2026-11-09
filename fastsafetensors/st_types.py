@@ -9,12 +9,17 @@ class DeviceType(Enum):
     CPU = "cpu"
     CUDA = "cuda"
     GPU = "gpu"
+    SPYRE = "spyre"
 
 
 @dataclass(frozen=True)
 class Device:
     type: DeviceType = DeviceType.CPU
     index: Optional[int] = None
+
+    @property
+    def is_gpu(self) -> bool:
+        return self.type in (DeviceType.CUDA, DeviceType.GPU)
 
     def as_str(self) -> str:
         if self.index is None:
@@ -23,23 +28,18 @@ class Device:
 
     @classmethod
     def from_str(cls, s: str) -> "Device":
-        if ":" in s:
-            type_str, index_str = s.split(":", 1)
-            try:
-                dev_type = DeviceType(type_str.lower())
-            except ValueError:
-                raise ValueError(f"Unknown device type: {type_str}")
+        type_str, sep, index_str = s.partition(":")
+        index: Optional[int] = None
+        if sep:
             try:
                 index = int(index_str)
             except ValueError:
                 raise ValueError(f"Invalid index: {index_str}")
-            return cls(type=dev_type, index=index)
-        else:
-            try:
-                dev_type = DeviceType(s.lower())
-            except ValueError:
-                raise ValueError(f"Unknown device type: {s}")
-            return cls(type=dev_type, index=None)
+        try:
+            dev_type = DeviceType(type_str.lower())
+        except ValueError:
+            raise ValueError(f"Unknown device type: {type_str}") from None
+        return cls(type=dev_type, index=index)
 
 
 class DType(Enum):

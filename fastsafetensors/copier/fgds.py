@@ -12,7 +12,7 @@ from .. import cpp as _cpp
 from ..common import SafeTensorsMetadata, init_logger, is_gpu_found
 from ..frameworks import FrameworkOpBase, TensorBase
 from ..st_types import Device, DeviceType, DType
-from .base import CopierInterface
+from .base import CopierInterface, reject_spyre_device
 from .nogds import load_library_func, new_nogds_file_copier
 from .registry import CopierConstructFunc, register_copier_constructor
 
@@ -294,6 +294,7 @@ def new_fgds_file_copier(
     max_threads: int = 16,
     **kwargs,
 ) -> CopierConstructFunc:
+    reject_spyre_device(device, "fgds")
     # FGDS (libfgds.so) is Linux-only; bail out early on other platforms.
     if platform.system() != "Linux":
         warnings.warn(

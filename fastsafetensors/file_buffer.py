@@ -53,9 +53,11 @@ class FilesBufferOnDevice:
         auto_mem_delete: bool = True,
         keep_tensor: Optional[Callable[[str], bool]] = None,
         borrowed_tensors: bool = False,
+        device_native: bool = False,
     ):
         self.framework = framework
         self.borrowed_tensors = borrowed_tensors
+        self.device_native = device_native
         self.rank_loaders: Dict[int, List[LazyTensorFactory]] = rank_loaders
         self.key_to_rank_lidx: Dict[str, Tuple[int, int]] = {}
         self.instantiated: Dict[int, Dict[int, Dict[str, bool]]] = {}  # rank, key name
@@ -127,6 +129,12 @@ class FilesBufferOnDevice:
                         loader.metadata.src,
                     )
                 loader.free_dev_ptrs()
+        if self.device_native and (
+            dtype != DType.AUTO or (device is not None and device != ret.device)
+        ):
+            raise ValueError(
+                f"{tensor_name}: device-native tensors cannot be converted or moved"
+            )
         return ret.to(device=device, dtype=dtype)
 
     def get_sharded_wrapped(

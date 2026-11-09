@@ -233,12 +233,22 @@ class TestPipelineParallelSingleProcess:
 
     def test_none_pg_is_treated_as_single_process(self):
         loader = MagicMock()
+        # e.g. a GPU byte copier: its tensors view the file buffer.
+        loader.tensors_own_storage = False
 
         pipeline = PipelineParallel(None, loader, ["a.safetensors", "b.safetensors"])
 
         assert pipeline.weight_files_batches == [["a.safetensors"], ["b.safetensors"]]
         assert pipeline.log_prefix == "PG0"
         assert pipeline.need_clone is True
+
+    def test_owned_tensors_are_not_cloned(self):
+        loader = MagicMock()
+        loader.tensors_own_storage = True
+
+        pipeline = PipelineParallel(None, loader, ["a.safetensors"])
+
+        assert pipeline.need_clone is False
 
 
 class TestAutoLoaderConfigDiscovery:

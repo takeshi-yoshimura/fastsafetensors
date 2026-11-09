@@ -211,3 +211,22 @@ The fallback resolves a framework-bundled CUDA runtime first (for example,
 PyTorch's `torch\lib` directory), then checks system CUDA Toolkit locations.
 `FASTSAFETENSORS_CUDART_LIB` can specify an absolute runtime DLL explicitly and
 takes precedence over automatic discovery.
+
+
+Spyre-native checkpoints
+------------------------
+
+`copier_type="spyre_native"` loads converted checkpoint bytes into Spyre tensors.
+The checkpoint remains a standard safetensors file; its string metadata records
+the device format and logical tensor description. `fastsafetensors.saver` is the
+upstream writer API. The inference layer owns the model cache recipe and format
+encoding; the Spyre copier handles physical layout and raw transfers.
+
+Use `ParallelLoader(..., device="spyre:0", copier_type="spyre_native",
+all_local=True)` so each TP rank reads its local shards. Native tensors own their
+storage and are yielded without cloning. Device-native payloads cannot be cast,
+moved to a different device, sliced, or broadcast through a multi-rank loader
+group. CPU/CUDA loaders retain upstream shared-allocation, readiness, borrowed
+tensor and broadcast behavior. Device-native checkpoint writes use upstream
+`saver.WriteEntry.source`, `fill`, and `shard_metadata` callbacks; no separate
+writer implementation or native-specific saver API is needed.

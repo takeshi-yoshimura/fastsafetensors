@@ -184,6 +184,9 @@ class FrameworkOpBase(ABC, Generic[T, K]):
     def copy_tensor(self, dst: T, src: T) -> None:
         pass
 
+    def copy_to_buffer(self, src: Any, buf: memoryview) -> None:
+        self.wrap_tensor(src).copy_to_buffer(buf)
+
     def wrap_tensor(self, tensor: Any) -> T:
         """Wrap a framework-native tensor without copying its storage."""
         raise NotImplementedError(f"{self.get_name()}: wrap_tensor")

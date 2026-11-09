@@ -15,7 +15,7 @@ from ..common import (
 )
 from ..frameworks import FrameworkOpBase, TensorBase
 from ..st_types import Device, DeviceType, DType
-from .base import CopierInterface
+from .base import CopierInterface, reject_spyre_device
 from .nogds import new_nogds_file_copier
 from .registry import CopierConstructFunc, register_copier_constructor
 
@@ -186,6 +186,7 @@ class DStorageFileCopier(CopierInterface):
 @register_copier_constructor("dstorage", DStorageFileCopier)
 def new_dstorage_copier(device: Device, **kwargs) -> CopierConstructFunc:
     """Factory for DirectStorage file copier."""
+    reject_spyre_device(device, "dstorage")
     try:
         init_dstorage(
             device.index if device.index is not None else 0,
