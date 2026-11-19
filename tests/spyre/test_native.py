@@ -93,6 +93,38 @@ def _reference(tensors, layouts):
     return out
 
 
+def test_deferred_tensor_transfers():
+    tensors = _tensors()
+    tensors.update(
+        sliced=torch.randn(64, 256, dtype=torch.float16)[:, :128],
+        fp32=torch.randn(64, 64),
+        int32=torch.arange(128, dtype=torch.int32),
+    )
+    layouts = _layouts(tensors)
+    expected = {
+        name: (
+            source.to(DEVICE, dtype=source.dtype, device_layout=layouts[name]).cpu()
+            if name in layouts
+            else source.to(DEVICE).cpu()
+        )
+        for name, source in tensors.items()
+    }
+    recorder = transfer.TransferRecorder(DEVICE)
+    destinations = {
+        name: (
+            recorder.place_with_layout(source, layouts[name])
+            if name in layouts
+            else recorder(source)
+        )
+        for name, source in tensors.items()
+    }
+    assert recorder(destinations["linear"]) is destinations["linear"]
+    assert recorder.records[-1].kind == "same"
+    recorder.fill()
+    for name, destination in destinations.items():
+        torch.testing.assert_close(destination.cpu(), expected[name], rtol=0, atol=0)
+
+
 def _write_checkpoint(tensors, base, *, layouts=None, num_shards=2, plain=False):
     layouts = layouts or {}
     entries = []
@@ -131,6 +163,73 @@ def _write_checkpoint(tensors, base, *, layouts=None, num_shards=2, plain=False)
         base,
         metadata={"torch_spyre.moved": json.dumps(moved)},
     )
+
+
+def test_recorded_transfers_round_trip(tmp_path):
+    from fastsafetensors import SafeTensorsMetadata
+    from fastsafetensors.frameworks import get_framework_op
+
+    tensors = _tensors()
+    tensors["sliced"] = torch.randn(64, 256, dtype=torch.float16)[:, :128]
+    tensors["fp32"] = torch.randn(64, 64)
+    tensors["int32"] = torch.arange(128, dtype=torch.int32)
+    layouts = _layouts(tensors)
+    recorder = transfer.TransferRecorder(DEVICE)
+    expected = {}
+    destinations = {}
+    for name, source in tensors.items():
+        if name in layouts:
+            expected[name] = source.to(
+                DEVICE, dtype=source.dtype, device_layout=layouts[name]
+            ).cpu()
+            destinations[name] = recorder.place_with_layout(source, layouts[name])
+        else:
+            expected[name] = source.to(DEVICE).cpu()
+            destinations[name] = recorder(source)
+    recorder(destinations["linear"])
+    records, entries = recorder.checkpoint_entries()
+    paths = ParallelSaver(
+        num_shards=4,
+        fill=transfer.native_fill,
+        shard_metadata=transfer.native_shard_metadata,
+    ).save_entries(
+        entries,
+        str(tmp_path / "recorded"),
+        shard0_metadata={"transfers": json.dumps(records)},
+    )
+    framework = get_framework_op("pytorch")
+    metas = [SafeTensorsMetadata.from_file(path, framework) for path in paths]
+    records = json.loads(metas[0].metadata["transfers"])
+    headers = {name: meta for meta in metas for name in meta.tensors}
+    restorer = transfer.TransferRestorer(DEVICE, headers, records)
+    restored = {}
+    for name, source in tensors.items():
+        placeholder = torch.empty_strided(
+            source.size(), source.stride(), dtype=source.dtype, device="meta"
+        )
+        restored[name] = (
+            restorer.place_with_layout(placeholder, layouts[name])
+            if name in layouts
+            else restorer(placeholder)
+        )
+    assert restorer(restored["linear"]) is restored["linear"]
+    restorer.finish()
+    loader = ParallelLoader(
+        None,
+        paths,
+        device="spyre",
+        destinations=restorer.destinations,
+        tensor_filter=restorer.destinations.__contains__,
+        all_local=True,
+        set_numa=False,
+        accumulate_resident=False,
+    )
+    try:
+        dict(loader.iterate_weights())
+    finally:
+        loader.close()
+    for name, tensor in restored.items():
+        torch.testing.assert_close(tensor.cpu(), expected[name], rtol=0, atol=0)
 
 
 def test_round_trip(tmp_path):

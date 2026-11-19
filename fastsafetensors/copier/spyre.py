@@ -32,7 +32,8 @@ import time
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Mapping
 
 from .. import cpp as fstcpp
@@ -67,12 +68,62 @@ __all__ = [
     "MAX_TRANSFER_BYTES",
     "TransferPipeline",
     "stage_to_spyre",
+    "TransferRecorder",
+    "TransferRecord",
+    "TransferRestorer",
+    "is_dense_tensor",
+    "tensor_metadata",
+    "read_recorded_tensor",
+    "check_materialized",
+    "KEY_TRANSFERS",
+    "KEY_HOST",
+    "CACHE_FORMAT",
+    "KEY_CACHE_FORMAT",
+    "KEY_CACHE_KEY",
+    "KEY_FP8",
+    "cache_metadata",
+    "read_cache_metadata",
     "native_entry",
     "native_fill",
     "native_shard_metadata",
 ]
 # Plain payloads that must be restored to Spyre, with an optional device layout.
 KEY_MOVED = "torch_spyre.moved"
+KEY_TRANSFERS = "torch_spyre.transfers"
+KEY_HOST = "torch_spyre.host"
+CACHE_FORMAT = "torch_spyre-cache/3"
+KEY_CACHE_FORMAT = "torch_spyre.cache.format"
+KEY_CACHE_KEY = "torch_spyre.cache.key"
+KEY_FP8 = "torch_spyre.cache.fp8"
+
+
+def cache_metadata(key: Mapping[str, Any]) -> tuple[dict[str, str], dict[str, str]]:
+    """Encode opaque caller identity in the backend's cache envelope.
+
+    Returns metadata for every shard and metadata for shard zero, respectively.
+    The caller computes identity; this backend owns its on-disk keys
+    and format. FP8 payload recipes are reserved and currently unsupported.
+    """
+    return (
+        {
+            KEY_CACHE_FORMAT: CACHE_FORMAT,
+            KEY_CACHE_KEY: json.dumps(dict(key), sort_keys=True),
+        },
+        {KEY_FP8: "[]"},
+    )
+
+
+def read_cache_metadata(metadata: Mapping[str, str], key: Mapping[str, Any]) -> None:
+    """Validate cache format, caller identity and the absence of FP8 recipes."""
+    try:
+        if metadata[KEY_CACHE_FORMAT] != CACHE_FORMAT or metadata[
+            KEY_CACHE_KEY
+        ] != json.dumps(dict(key), sort_keys=True):
+            raise NativeFormatError("cache is for another identity or format")
+        if json.loads(metadata[KEY_FP8]) != []:
+            raise NativeFormatError("FP8 cache payload recipes are not supported")
+    except (KeyError, TypeError, ValueError) as e:
+        raise NativeFormatError(f"invalid Spyre cache metadata: {e}") from e
 
 
 # Preserve the native checkpoint admission limit; larger or multi-chunk tensors
@@ -86,6 +137,481 @@ _READ_BLOCK_BYTES = 256 << 20
 MAP_LOCK = threading.RLock()
 # Retain uncertain in-flight memory until process exit; do not reuse this runtime.
 _failed_transfers: list[tuple[list[torch.Tensor], list[torch.Tensor]]] = []
+
+
+def is_dense_tensor(t: torch.Tensor) -> bool:
+    """Whether a tensor is non-overlapping and dense, including transposes."""
+    expected = 1
+    for stride, size in sorted((s, n) for s, n in zip(t.stride(), t.shape) if n != 1):
+        if stride != expected:
+            return False
+        expected *= size
+    return True
+
+
+def _unstageable_reason(t: torch.Tensor) -> str | None:
+    import torch
+
+    if t.device.type not in ("cpu", "meta"):
+        return f"on {t.device.type}"
+    if t.dtype != torch.float16:
+        return str(t.dtype)
+    if t.numel() == 0 or t.requires_grad or not is_dense_tensor(t):
+        return "empty/grad/non-dense"
+    return None
+
+
+def tensor_metadata(t: torch.Tensor) -> dict:
+    """Logical tensor description used by transfer and host-state records."""
+    from ..frameworks._torch import fst_dtype
+
+    try:
+        fst_dtype(t.dtype)
+    except KeyError:
+        raise NativeFormatError(
+            f"dtype {t.dtype} has no safetensors equivalent"
+        ) from None
+    return {
+        "size": list(t.shape),
+        "stride": list(t.stride()),
+        "dtype": str(t.dtype).removeprefix("torch."),
+    }
+
+
+def _layout_json(layout) -> dict | None:
+    if layout is None:
+        return None
+    from torch_spyre.layout import layout_to_json
+
+    return layout_to_json(layout)
+
+
+def read_recorded_tensor(
+    headers: Mapping[str, SafeTensorsMetadata], record: Mapping[str, Any]
+) -> torch.Tensor:
+    """Read an ordinary tensor and recover recorded dense strides, if needed."""
+    import torch
+    from safetensors import safe_open
+
+    name = record["name"]
+    if name in native_specs(headers[name]):
+        raise NativeFormatError(
+            f"{name}: expected an ordinary tensor, got a native payload"
+        )
+    with safe_open(headers[name].src, framework="pt", device="cpu") as checkpoint:
+        tensor = checkpoint.get_tensor(name)
+    if (
+        list(tensor.shape) != record["size"]
+        or str(tensor.dtype).removeprefix("torch.") != record["dtype"]
+    ):
+        raise NativeFormatError(f"{name}: stored tensor does not match its record")
+    if record["dense"] and list(tensor.stride()) != record["stride"]:
+        out = torch.empty_strided(record["size"], record["stride"], dtype=tensor.dtype)
+        out.copy_(tensor)
+        return out
+    return tensor
+
+
+def _tensor_paths(model):
+    """Tensor references in module state, without inspecting arbitrary objects."""
+    import torch
+
+    def walk(value, path, ancestors):
+        if isinstance(value, torch.Tensor):
+            yield path, value
+            return
+        if id(value) in ancestors or isinstance(value, torch.nn.Module):
+            return
+        ancestors = ancestors | {id(value)}
+        if isinstance(value, dict):
+            items = (
+                (["key", k], v)
+                for k, v in value.items()
+                if k is None or type(k) in (str, int, bool)
+            )
+        elif isinstance(value, (list, tuple)):
+            items = ((["index", i], v) for i, v in enumerate(value))
+        elif is_dataclass(value) and not isinstance(value, type):
+            items = ((["attr", f.name], getattr(value, f.name)) for f in fields(value))
+        elif isinstance(value, SimpleNamespace):
+            items = ((["attr", k], v) for k, v in vars(value).items())
+        else:
+            return
+        for step, item in items:
+            yield from walk(item, path + [step], ancestors)
+
+    for prefix, module in model.named_modules():
+        for name, value in vars(module).items():
+            if name != "_modules":
+                for path, tensor in walk(value, [["attr", name]], frozenset()):
+                    yield prefix, path, tensor
+
+
+def _resolve_tensor(model, module, path):
+    import torch
+
+    if not isinstance(module, str) or not isinstance(path, list) or not path:
+        raise NativeFormatError("invalid host tensor path")
+    value = model
+    try:
+        for name in module.split(".") if module else ():
+            value = value._modules[name]
+        for kind, key in path:
+            if kind == "attr" and isinstance(key, str):
+                if (
+                    is_dataclass(value)
+                    and not isinstance(value, type)
+                    and key in {f.name for f in fields(value)}
+                ):
+                    value = getattr(value, key)
+                else:
+                    value = vars(value)[key]
+            elif (
+                kind == "key"
+                and isinstance(value, dict)
+                and (key is None or type(key) in (str, int, bool))
+            ):
+                value = value[key]
+            elif (
+                kind == "index"
+                and isinstance(value, (list, tuple))
+                and type(key) is int
+                and 0 <= key < len(value)
+            ):
+                value = value[key]
+            else:
+                raise NativeFormatError("invalid host tensor path step")
+    except (KeyError, TypeError, ValueError, AttributeError) as e:
+        raise NativeFormatError(
+            f"host tensor path {module!r} {path!r} is missing or invalid"
+        ) from e
+    if not isinstance(value, torch.Tensor):
+        raise NativeFormatError(f"host path {module!r} {path!r} is not a tensor")
+    return value
+
+
+def check_materialized(model) -> None:
+    """Reject remaining meta tensors in the supported module-state containers."""
+    for module, path, tensor in _tensor_paths(model):
+        if tensor.is_meta:
+            raise NativeFormatError(f"tensor {module!r} {path!r} is still on meta")
+
+
+def _swap_in(target, data) -> None:
+    import torch
+
+    replacement = torch.Tensor._make_subclass(type(target), data, target.requires_grad)
+    replacement.__dict__.update(target.__dict__)
+    torch.utils.swap_tensors(target, replacement)
+
+
+@dataclass
+class TransferRecord:
+    """One tensor transfer: already present, deferred, or moved immediately."""
+
+    kind: str  # "same", "defer", or "to"
+    src: torch.Tensor
+    dst: torch.Tensor
+    layout: Any = None
+
+
+class TransferRecorder:
+    """Allocate tensor destinations now and fill eligible fp16 tensors in bulk.
+
+    Callable as a tensor conversion function, with ``place_with_layout`` for
+    explicit Spyre placement. Deferred destinations contain no data until
+    ``fill`` completes; callers must not read them during traversal. The caller
+    owns model traversal and model-level checkpoint policy.
+    """
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self.records: list[TransferRecord] = []
+        self._host_paths: list[tuple[str, list]] | None = None
+
+    def capture_host_state(self, model) -> None:
+        """Remember tensor paths before traversal; derived transfer caches are not saved."""
+        check_materialized(model)
+        self._host_paths = [
+            (module, path)
+            for module, path, tensor in _tensor_paths(model)
+            if tensor.device.type == "cpu"
+        ]
+
+    def checkpoint_metadata(self, model) -> tuple[dict[str, str], list[WriteEntry]]:
+        """Encode transfers and surviving CPU state using backend-owned metadata keys."""
+        from ..saver import plain_entry
+
+        if self._host_paths is None:
+            raise NativeFormatError("capture_host_state must precede model traversal")
+        check_materialized(model)
+        records, entries = self.checkpoint_entries()
+        host, names = [], {}
+        for module, path in self._host_paths:
+            try:
+                tensor = _resolve_tensor(model, module, path)
+            except NativeFormatError:
+                # _apply may remove or replace a transfer source.
+                continue
+            if tensor.device.type != "cpu":
+                continue
+            name = names.get(id(tensor))
+            if name is None:
+                name = f"h{len(names)}"
+                names[id(tensor)] = name
+                entries.append(plain_entry(name, tensor.detach()))
+            host.append(
+                {
+                    "module": module,
+                    "path": path,
+                    "device": "cpu",
+                    "name": name,
+                    **tensor_metadata(tensor),
+                    "dense": is_dense_tensor(tensor),
+                }
+            )
+        return {KEY_TRANSFERS: json.dumps(records), KEY_HOST: json.dumps(host)}, entries
+
+    def __call__(self, t: torch.Tensor) -> torch.Tensor:
+        import torch
+
+        if t.device.type == self.device.type:
+            dst = t.to(self.device)
+            kind = "same"
+        elif _unstageable_reason(t) is not None:
+            dst = t.to(self.device)
+            kind = "to"
+        else:
+            dst = torch.empty_strided(
+                t.size(), t.stride(), dtype=t.dtype, device=self.device
+            )
+            kind = "defer"
+        # _apply may rebind a Parameter's .data; retain its original storage.
+        self.records.append(TransferRecord(kind, t.detach(), dst))
+        return dst
+
+    def place_with_layout(self, src: torch.Tensor, layout) -> torch.Tensor:
+        """Defer ``src.to(device, dtype=src.dtype, device_layout=layout)``."""
+        from torch_spyre._C import spyre_empty_with_layout
+
+        if src.device.type == self.device.type:
+            dst = src.to(self.device, dtype=src.dtype, device_layout=layout)
+            kind = "same"
+        elif _unstageable_reason(src) is not None:
+            dst = src.to(self.device, dtype=src.dtype, device_layout=layout)
+            kind = "to"
+        else:
+            dst = spyre_empty_with_layout(
+                src.size(), src.stride(), src.dtype, layout, device=self.device
+            )
+            kind = "defer"
+        self.records.append(TransferRecord(kind, src.detach(), dst, layout))
+        return dst
+
+    def fill(self) -> TransferPipeline:
+        """Complete deferred transfers, propagating pipeline failures."""
+        pipeline = stage_to_spyre(
+            [(r.src, r.dst) for r in self.records if r.kind == "defer"], self.device
+        )
+        for r in self.records:
+            if r.kind == "to":
+                pipeline.count(".to()", r.src.nbytes)
+        return pipeline
+
+    def checkpoint_entries(
+        self, *, prefix: str = "t"
+    ) -> tuple[list[dict], list[WriteEntry]]:
+        """Describe recorded transfers for saving, without filling destinations.
+
+        Returns JSON-serializable replay records and saver entries. Persist the
+        records with KEY_TRANSFERS and use native_fill/native_shard_metadata
+        to write the entries. Deferred destinations still contain no data.
+        """
+        from ..saver import plain_entry
+
+        records, entries = [], []
+        for seq, transfer in enumerate(self.records):
+            record = {
+                "kind": transfer.kind,
+                **tensor_metadata(transfer.src),
+                "placed": _layout_json(transfer.layout),
+            }
+            nbytes = 0
+            if transfer.kind == "defer":
+                from torch_spyre._C import dma_bytes, get_spyre_tensor_layout
+
+                nbytes = dma_bytes(transfer.dst)
+            name = f"{prefix}{seq}"
+            if transfer.kind == "defer" and 0 < nbytes <= MAX_TRANSFER_BYTES:
+                layout = _layout_json(get_spyre_tensor_layout(transfer.dst))
+                record.update(kind="raw", name=name, layout=layout)
+                entries.append(
+                    native_entry(
+                        name, transfer.src, transfer.dst, nbytes=nbytes, layout=layout
+                    )
+                )
+            elif transfer.kind != "same":
+                record.update(kind="to", name=name, dense=is_dense_tensor(transfer.src))
+                entries.append(plain_entry(name, transfer.src))
+            records.append(record)
+        return records, entries
+
+
+class TransferRestorer:
+    """Replay tensor transfers in call order, independently of model traversal.
+
+    Raw destinations are allocated but not filled. Call finish after traversal
+    to check record exhaustion, then fill destinations with ParallelLoader.
+    Any mismatch raises NativeFormatError; discard partially restored state.
+    """
+
+    def __init__(
+        self,
+        device: torch.device,
+        headers: Mapping[str, SafeTensorsMetadata],
+        records: Sequence[dict],
+    ) -> None:
+        self.device = device
+        self.headers = headers
+        self.records = records
+        self.seq = 0
+        self.destinations: dict[str, torch.Tensor] = {}
+        self.host: list[dict] = []
+
+    @classmethod
+    def from_metadata(cls, device, headers, metadata):
+        """Read the backend's transfer and CPU-state recipes, without inference imports."""
+        try:
+            records, host = json.loads(metadata[KEY_TRANSFERS]), json.loads(
+                metadata[KEY_HOST]
+            )
+            if not isinstance(records, list) or not isinstance(host, list):
+                raise ValueError("transfer and host recipes must be lists")
+            if not all(isinstance(record, dict) for record in records + host):
+                raise ValueError("transfer and host records must be objects")
+        except (KeyError, TypeError, ValueError) as e:
+            raise NativeFormatError(f"invalid Spyre replay metadata: {e}") from e
+        restorer = cls(device, headers, records)
+        restorer.host = host
+        return restorer
+
+    def restore_host_state(self, model) -> None:
+        """Resolve recorded CPU paths directly and validate all aliases before swapping."""
+        targets, aliases, names, paths = [], {}, {}, set()
+        try:
+            for record in self.host:
+                path = json.dumps([record["module"], record["path"]])
+                if path in paths or record["device"] != "cpu":
+                    raise NativeFormatError(
+                        "duplicate host path or invalid host device"
+                    )
+                paths.add(path)
+                target = _resolve_tensor(model, record["module"], record["path"])
+                if (
+                    target.device.type not in ("cpu", "meta")
+                    or list(target.shape) != record["size"]
+                    or tensor_metadata(target)["dtype"] != record["dtype"]
+                ):
+                    raise NativeFormatError(
+                        f"host tensor {path} differs from its record"
+                    )
+                name, identity = record["name"], id(target)
+                if (
+                    aliases.setdefault(name, identity) != identity
+                    or names.setdefault(identity, name) != name
+                ):
+                    raise NativeFormatError(f"host tensor aliases differ at {path}")
+                targets.append((target, record))
+        except (KeyError, TypeError, ValueError) as e:
+            raise NativeFormatError(f"invalid host tensor recipe: {e}") from e
+        restored = set()
+        for target, record in targets:
+            if id(target) not in restored:
+                _swap_in(target, read_recorded_tensor(self.headers, record))
+                restored.add(id(target))
+
+    def _next(self, tensor: torch.Tensor, placed) -> dict:
+        if self.seq >= len(self.records):
+            raise NativeFormatError("more tensors to move than recorded")
+        record = self.records[self.seq]
+        if (
+            list(tensor.shape) != record["size"]
+            or str(tensor.dtype).removeprefix("torch.") != record["dtype"]
+            or _layout_json(placed) != record["placed"]
+        ):
+            raise NativeFormatError(
+                f"move #{self.seq}: tensor or placed layout does not match its record"
+            )
+        if record["kind"] not in ("same", "to", "raw"):
+            raise NativeFormatError(
+                f"move #{self.seq}: unknown transfer kind {record['kind']!r}"
+            )
+        self.seq += 1
+        return record
+
+    def _restore(self, tensor: torch.Tensor, placed=None) -> torch.Tensor:
+        record = self._next(tensor, placed)
+        if record["kind"] == "same":
+            if tensor.device.type != self.device.type:
+                raise NativeFormatError(
+                    f"move #{self.seq - 1} was a revisit, got {tensor.device}"
+                )
+            return self._move(tensor, placed)
+        if record["kind"] == "to":
+            return self._move(read_recorded_tensor(self.headers, record), placed)
+        if list(tensor.stride()) != record["stride"]:
+            raise NativeFormatError(
+                f"move #{self.seq - 1}: strides {list(tensor.stride())} != {record['stride']}"
+            )
+        from torch_spyre._C import dma_bytes, spyre_empty_with_layout
+        from torch_spyre.layout import layout_from_json
+
+        from ..frameworks._torch import dtype_convert
+
+        name = record["name"]
+        metadata = self.headers[name]
+        if native_format(metadata) != NATIVE_FORMAT:
+            raise NativeFormatError(f"{name}: incompatible native format")
+        spec = native_specs(metadata)[name]
+        dtype = dtype_convert[spec.dtype]
+        if (
+            spec.shape != record["size"]
+            or spec.stride != record["stride"]
+            or str(dtype).removeprefix("torch.") != record["dtype"]
+            or spec.layout != record["layout"]
+        ):
+            raise NativeFormatError(f"{name}: native payload does not match its record")
+        dst = spyre_empty_with_layout(
+            spec.shape,
+            spec.stride,
+            dtype,
+            layout_from_json(spec.layout),
+            device=self.device,
+        )
+        if dma_bytes(dst) != spec.nbytes:
+            raise NativeFormatError(
+                f"move #{self.seq - 1}: device size differs from payload"
+            )
+        self.destinations[name] = dst
+        return dst
+
+    def _move(self, source: torch.Tensor, placed) -> torch.Tensor:
+        if placed is None:
+            return source.to(self.device)
+        return source.to(self.device, dtype=source.dtype, device_layout=placed)  # type: ignore[call-overload]
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        return self._restore(tensor)
+
+    def place_with_layout(self, source: torch.Tensor, layout) -> torch.Tensor:
+        return self._restore(source, layout)
+
+    def finish(self) -> None:
+        """Check that traversal consumed all records; does not start any DMA."""
+        if self.seq != len(self.records):
+            raise NativeFormatError(
+                f"moved {self.seq} tensors, recorded {len(self.records)}"
+            )
 
 
 @dataclass(frozen=True)
