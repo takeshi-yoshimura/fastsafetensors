@@ -55,6 +55,33 @@ class NativeTensorSpec:
     nbytes: int
 
 
+def native_metadata(
+    fmt: NativeFormat, specs: Mapping[str, NativeTensorSpec]
+) -> Dict[str, str]:
+    """Encode native tensor descriptions as standard safetensors string metadata.
+
+    Layouts are opaque to this layer. Payload sizes come from the tensor table,
+    not this metadata, when the checkpoint is read.
+    """
+    return {
+        KEY_VERSION: str(fmt.version),
+        KEY_DEVICE: fmt.device,
+        KEY_FORMAT: fmt.format,
+        KEY_TENSORS: json.dumps(
+            {
+                name: {
+                    "dtype": spec.dtype.value,
+                    "shape": list(spec.shape),
+                    "stride": None if spec.stride is None else list(spec.stride),
+                    "layout": spec.layout,
+                }
+                for name, spec in specs.items()
+            },
+            separators=(",", ":"),
+        ),
+    }
+
+
 def _metadata_dict(meta: SafeTensorsMetadata) -> Mapping[str, str]:
     return meta.metadata if isinstance(meta.metadata, dict) else {}
 

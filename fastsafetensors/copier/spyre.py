@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre-native checkpoint loading and host-to-device staging.
+"""Spyre-native checkpoint encoding, loading and host-to-device staging.
 
 Importing this module registers the copier without importing torch-spyre.
 Spyre operations load the optional dependency when needed. This module
-schedules reads, conversion, and transfers; torch-spyre provides device
-primitives and flex owns IOMMU mapping. Buffers are reused only after the
+schedules checkpoint encoding, reads, conversion, and transfers; torch-spyre
+provides device primitives and flex owns IOMMU mapping. Buffers are reused only after the
 current stream completes; failed synchronization retains buffers and
 destinations because a shut-down stream may return before its DMA finishes.
 """
@@ -37,7 +37,15 @@ from typing import TYPE_CHECKING, Any, Mapping
 
 from .. import cpp as fstcpp
 from ..common import SafeTensorsMetadata
-from ..native import NativeFormat, NativeFormatError, native_format, native_specs
+from ..native import (
+    NativeFormat,
+    NativeFormatError,
+    NativeTensorSpec,
+    native_format,
+    native_metadata,
+    native_specs,
+)
+from ..saver import WriteEntry, tensor_fill
 from ..st_types import Device, DeviceType, DType
 from .base import CopierInterface, DummyDeviceBuffer
 from .registry import register_copier_constructor
@@ -59,6 +67,9 @@ __all__ = [
     "MAX_TRANSFER_BYTES",
     "TransferPipeline",
     "stage_to_spyre",
+    "native_entry",
+    "native_fill",
+    "native_shard_metadata",
 ]
 # Plain payloads that must be restored to Spyre, with an optional device layout.
 KEY_MOVED = "torch_spyre.moved"
@@ -75,6 +86,75 @@ _READ_BLOCK_BYTES = 256 << 20
 MAP_LOCK = threading.RLock()
 # Retain uncertain in-flight memory until process exit; do not reuse this runtime.
 _failed_transfers: list[tuple[list[torch.Tensor], list[torch.Tensor]]] = []
+
+
+@dataclass(frozen=True)
+class _NativePayload:
+    src: torch.Tensor
+    dst: torch.Tensor
+    spec: NativeTensorSpec
+
+
+def native_entry(
+    name: str,
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    *,
+    nbytes: int,
+    layout: Any,
+) -> WriteEntry:
+    """Describe a host tensor encoded for an allocated Spyre destination.
+
+    ``nbytes`` and ``layout`` describe dst's physical storage, as reported by
+    torch-spyre. No conversion or device transfer happens until native_fill.
+    """
+    from ..frameworks._torch import fst_dtype
+
+    if nbytes <= 0:
+        raise ValueError(f"{name}: native payload size must be positive")
+    spec = NativeTensorSpec(
+        name,
+        fst_dtype(dst.dtype),
+        list(dst.shape),
+        list(dst.stride()),
+        layout,
+        nbytes,
+    )
+    return WriteEntry(name, DType.U8, [nbytes], nbytes, _NativePayload(src, dst, spec))
+
+
+def native_shard_metadata(entries: Sequence[WriteEntry]) -> dict[str, str]:
+    """ParallelSaver callback describing this shard's Spyre-native payloads."""
+    return native_metadata(
+        NATIVE_FORMAT,
+        {
+            e.name: e.source.spec
+            for e in entries
+            if isinstance(e.source, _NativePayload)
+        },
+    )
+
+
+def native_fill(work: list[tuple[memoryview, WriteEntry]]) -> None:
+    """ParallelSaver callback encoding native entries and copying plain tensors.
+
+    Conversion writes directly into the saver-owned buffers; allocated Spyre
+    destinations describe the layout but are not filled by this operation.
+    """
+    plain, native = [], []
+    for buf, entry in work:
+        (native if isinstance(entry.source, _NativePayload) else plain).append(
+            (buf, entry)
+        )
+    if plain:
+        tensor_fill()(plain)
+    if native:
+        from torch_spyre._C import convert_h2d_into
+
+        convert_h2d_into(
+            [(buf, entry.source.src, entry.source.dst) for buf, entry in native],
+            num_threads=min(64, os.cpu_count() or 1),
+        )
 
 
 @dataclass(frozen=True)

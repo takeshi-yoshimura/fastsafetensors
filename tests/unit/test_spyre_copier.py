@@ -519,6 +519,62 @@ def test_real_copier_reads_shards_and_preserves_destinations(
     assert len(emulated_spyre.allocated) == (0 if filtered else 1)
 
 
+def test_backend_writer_round_trip_into_existing_destination(
+    emulated_spyre, tmp_path, monkeypatch
+):
+    import torch
+
+    from fastsafetensors.copier.spyre import (
+        native_entry,
+        native_fill,
+        native_shard_metadata,
+    )
+    from fastsafetensors.saver import ParallelSaver, plain_entry
+
+    def encode(work, num_threads):
+        for buf, src, dst in work:
+            assert len(buf) == dst.nbytes
+            buf[:] = src.reshape(-1).view(torch.uint8).numpy().tobytes()
+
+    monkeypatch.setattr(
+        sys.modules["torch_spyre._C"], "convert_h2d_into", encode, raising=False
+    )
+    tensor = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    plain = torch.arange(3, dtype=torch.float32)
+    destination = torch.empty_like(tensor)
+    paths = ParallelSaver(
+        num_shards=2, fill=native_fill, shard_metadata=native_shard_metadata
+    ).save_entries(
+        [
+            native_entry(
+                "native",
+                tensor,
+                destination,
+                nbytes=destination.nbytes,
+                layout=emulated_spyre.layout,
+            ),
+            plain_entry("plain", plain),
+        ],
+        str(tmp_path / "writer"),
+    )
+    loader = ParallelLoader(
+        None,
+        paths,
+        device="spyre:0",
+        destinations={"native": destination},
+        all_local=True,
+        set_numa=False,
+        use_tqdm_on_load=False,
+    )
+    try:
+        got = dict(loader.iterate_weights())
+    finally:
+        loader.close()
+    assert got["native"] is destination
+    torch.testing.assert_close(destination, tensor, rtol=0, atol=0)
+    torch.testing.assert_close(got["plain"], plain, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("mismatch", ["shape", "dtype", "layout", "size", "format"])
 def test_real_copier_rejects_incompatible_payload_before_dma(
     emulated_spyre, tmp_path, mismatch, monkeypatch

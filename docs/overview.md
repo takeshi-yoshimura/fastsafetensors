@@ -218,15 +218,50 @@ Spyre-native checkpoints
 
 `copier_type="spyre_native"` loads converted checkpoint bytes into Spyre tensors.
 The checkpoint remains a standard safetensors file; its string metadata records
-the device format and logical tensor description. `fastsafetensors.saver` is the
-upstream writer API. The inference layer owns the model cache recipe and format
-encoding; the Spyre copier handles physical layout and raw transfers.
+the device format and logical tensor description. `fastsafetensors.native` owns
+the shared metadata convention: `NativeFormat`, `NativeTensorSpec`,
+`native_metadata`, `native_format`, and `native_specs`. Backend layout values
+are opaque to that layer. The inference layer owns only the model cache recipe
+(tensor selection, TP rank, cache keys, model traversal and reconstruction).
+The Spyre backend owns `torch_spyre/1` checkpoint encoding and raw transfers;
+torch-spyre defines the physical layout and supplies conversion primitives.
 
 Use `ParallelLoader(..., device="spyre:0", copier_type="spyre_native",
 all_local=True)` so each TP rank reads its local shards. Native tensors own their
 storage and are yielded without cloning. Device-native payloads cannot be cast,
 moved to a different device, sliced, or broadcast through a multi-rank loader
 group. CPU/CUDA loaders retain upstream shared-allocation, readiness, borrowed
-tensor and broadcast behavior. Device-native checkpoint writes use upstream
-`saver.WriteEntry.source`, `fill`, and `shard_metadata` callbacks; no separate
-writer implementation or native-specific saver API is needed.
+tensor and broadcast behavior.
+
+Write converted host weights with the same `ParallelSaver` used for ordinary
+tensors, using the Spyre backend's entry and callback helpers:
+
+```python
+from fastsafetensors import ParallelSaver
+from fastsafetensors.copier.spyre import (
+    native_entry, native_fill, native_shard_metadata,
+)
+from fastsafetensors.saver import plain_entry
+from torch_spyre._C import dma_bytes, get_spyre_tensor_layout
+from torch_spyre.layout import layout_to_json
+
+# src is a loaded CPU tensor; dst is an allocated Spyre tensor with its final
+# logical shape, strides, dtype and physical layout (no data transfer required).
+entries = [native_entry(
+    "weight", src, dst, nbytes=dma_bytes(dst),
+    layout=layout_to_json(get_spyre_tensor_layout(dst)),
+)]
+# Ordinary CPU tensors can share the same shards.
+entries.append(plain_entry("scale", scale))
+paths = ParallelSaver(
+    fill=native_fill, shard_metadata=native_shard_metadata,
+).save_entries(entries, "/cache/weights")
+```
+
+The callbacks encode directly into saver-owned buffers. `dst` describes the
+conversion target but is not filled by the save. The generic saver still treats
+sources and application metadata as opaque; it contains no Spyre-specific logic.
+Importing the backend does not import torch-spyre. Native conversion loads that
+optional dependency only when needed. The version-1 `fst.native.*` keys and
+payload representation are unchanged; model cache invalidation remains the
+inference layer's responsibility.

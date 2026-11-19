@@ -31,7 +31,6 @@ import torch_spyre  # noqa: F401 -- registers the device
 from safetensors import safe_open
 from torch_spyre._C import (
     SpyreTensorLayout,
-    convert_h2d_into,
     copy_tensor,
     dma_bytes,
     get_device_dtype,
@@ -43,11 +42,8 @@ from torch_spyre.layout import layout_to_json
 
 from fastsafetensors import ParallelLoader, ParallelSaver, fastsafe_open
 from fastsafetensors.copier import spyre as transfer
-from fastsafetensors.copier.spyre import NATIVE_FORMAT
-from fastsafetensors.frameworks._torch import fst_dtype
 from fastsafetensors.native import NativeFormatError
-from fastsafetensors.saver import WriteEntry, plain_entry, tensor_fill
-from fastsafetensors.st_types import DType
+from fastsafetensors.saver import plain_entry
 
 DEVICE = torch.device("spyre")
 
@@ -101,7 +97,6 @@ def _write_checkpoint(tensors, base, *, layouts=None, num_shards=2, plain=False)
     layouts = layouts or {}
     entries = []
     moved = {}
-    specs = {}
     for name, t in tensors.items():
         layout = layouts.get(name)
         if plain:
@@ -116,39 +111,20 @@ def _write_checkpoint(tensors, base, *, layouts=None, num_shards=2, plain=False)
                 )
             )
             nbytes = dma_bytes(dst)
-            specs[name] = {
-                "dtype": fst_dtype(dst.dtype).value,
-                "shape": list(dst.shape),
-                "stride": list(dst.stride()),
-                "layout": layout_to_json(get_spyre_tensor_layout(dst)),
-            }
             entries.append(
-                WriteEntry(
+                transfer.native_entry(
                     name,
-                    DType.U8,
-                    [nbytes],
-                    nbytes,
-                    source=(t, dst),
+                    t,
+                    dst,
+                    nbytes=nbytes,
+                    layout=layout_to_json(get_spyre_tensor_layout(dst)),
                 )
             )
 
-    def fill(work):
-        tensor_fill()([(buf, e) for buf, e in work if e.name not in specs])
-        native_work = [(buf, *e.source) for buf, e in work if e.name in specs]
-        if native_work:
-            convert_h2d_into(native_work)
-
     saver = ParallelSaver(
         num_shards=num_shards,
-        fill=fill,
-        shard_metadata=lambda shard: {
-            "fst.native.version": str(NATIVE_FORMAT.version),
-            "fst.native.device": NATIVE_FORMAT.device,
-            "fst.native.format": NATIVE_FORMAT.format,
-            "fst.native.tensors": json.dumps(
-                {e.name: specs[e.name] for e in shard if e.name in specs}
-            ),
-        },
+        fill=transfer.native_fill,
+        shard_metadata=transfer.native_shard_metadata,
     )
     return saver.save_entries(
         entries,

@@ -14,7 +14,9 @@ from fastsafetensors.native import (
     KEY_VERSION,
     NativeFormat,
     NativeFormatError,
+    NativeTensorSpec,
     native_format,
+    native_metadata,
     native_specs,
 )
 from fastsafetensors.saver import (
@@ -33,12 +35,7 @@ torch = pytest.importorskip("torch")
 def test_native_and_plain_entries_with_upstream_saver(tmp_path, framework, num_shards):
     payload = bytes(range(48))
     plain = torch.ones(3)
-    spec = {
-        "dtype": "F16",
-        "shape": [4, 4],
-        "stride": [4, 1],
-        "layout": {"tiles": 2},
-    }
+    spec = NativeTensorSpec("w", DType.F16, [4, 4], [4, 1], {"tiles": 2}, 48)
 
     def fill(work):
         tensor_fill()([(buf, e) for buf, e in work if e.name != "w"])
@@ -49,12 +46,10 @@ def test_native_and_plain_entries_with_upstream_saver(tmp_path, framework, num_s
     paths = ParallelSaver(
         num_shards=num_shards,
         fill=fill,
-        shard_metadata=lambda entries: {
-            KEY_VERSION: "1",
-            KEY_DEVICE: "fakedev",
-            KEY_FORMAT: "fake/1",
-            KEY_TENSORS: json.dumps({e.name: spec for e in entries if e.name == "w"}),
-        },
+        shard_metadata=lambda entries: native_metadata(
+            NativeFormat("fakedev", "fake/1"),
+            {e.name: spec for e in entries if e.name == "w"},
+        ),
     ).save_entries(
         [WriteEntry("w", DType.U8, [48], 48, payload), plain_entry("plain", plain)],
         str(tmp_path / "native"),
@@ -82,6 +77,27 @@ def test_native_and_plain_entries_with_upstream_saver(tmp_path, framework, num_s
                     assert actual.numpy().tobytes() == payload
                 else:
                     torch.testing.assert_close(actual, plain)
+
+
+@pytest.mark.parametrize("stride", [None, [1, 4]])
+def test_native_metadata_matches_version_one_convention(stride):
+    spec = NativeTensorSpec("w", DType.F16, [4, 4], stride, {"tiles": 2}, 48)
+    assert native_metadata(NativeFormat("fakedev", "fake/1"), {"w": spec}) == {
+        "fst.native.version": "1",
+        "fst.native.device": "fakedev",
+        "fst.native.format": "fake/1",
+        "fst.native.tensors": json.dumps(
+            {
+                "w": {
+                    "dtype": "F16",
+                    "shape": [4, 4],
+                    "stride": stride,
+                    "layout": {"tiles": 2},
+                }
+            },
+            separators=(",", ":"),
+        ),
+    }
 
 
 @pytest.fixture
