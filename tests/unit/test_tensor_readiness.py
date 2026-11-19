@@ -163,6 +163,30 @@ def test_close_drains_transfer_before_freeing_buffer(delayed_load):
     assert loader.framework.get_mem_used() == 0
 
 
+@pytest.mark.parametrize("track_progress", [False, True])
+def test_cpu_large_unaligned_read_with_tiny_bounce(tmp_path, track_progress):
+    import torch
+
+    payload = bytes(range(256)) * 32769 + b"tail"
+    path = tmp_path / "unaligned.bin"
+    path.write_bytes(b"P" * 17 + payload + b"S" * 13)
+    output = torch.full((len(payload) + 74,), 0xA5, dtype=torch.uint8)
+    buffer = cpp.gds_device_buffer(output.data_ptr(), output.numel(), False)
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    reader = cpp.nogds_file_reader(False, 1, 4, False, -1)
+    try:
+        request = reader.submit_read(fd, buffer, 17, len(payload), 37, track_progress)
+        if track_progress:
+            assert reader.wait_read_prefix(request, len(payload)) == len(payload)
+        assert reader.wait_read(request) == output.data_ptr() + 37
+        assert output[:37].tolist() == [0xA5] * 37
+        assert output[-37:].tolist() == [0xA5] * 37
+        assert output[37:-37].numpy().tobytes() == payload
+    finally:
+        del reader
+        os.close(fd)
+
+
 @pytest.mark.parametrize("target", ["cpu", "cuda:0"])
 def test_native_prefix_wait_and_error(tmp_path, target):
     import torch

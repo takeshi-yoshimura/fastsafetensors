@@ -17,5 +17,6 @@ from .registry import (
     get_copier_class,
     register_copier_constructor,
 )
+from .spyre import SpyreNativeCopier
 from .threefs import ThreeFSFileCopier
 from .unified import UnifiedMemCopier

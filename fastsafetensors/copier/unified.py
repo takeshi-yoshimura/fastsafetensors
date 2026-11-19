@@ -24,6 +24,7 @@ from ..frameworks import FrameworkOpBase, TensorBase
 from ..st_types import Device, DeviceType, DType
 from .base import (
     CopierInterface,
+    reject_spyre_device,
     validated_byte_ranges,
     validated_chunk_allocation_size,
 )
@@ -395,6 +396,7 @@ def new_unified_copier(device: Device, **kwargs) -> CopierConstructFunc:
 
     Returns a constructor that creates UnifiedMemCopier instances.
     """
+    reject_spyre_device(device, "unified")
     from .nogds import load_library_func
 
     load_library_func(kwargs.get("framework"))

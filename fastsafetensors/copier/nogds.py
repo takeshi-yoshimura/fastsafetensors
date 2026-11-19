@@ -25,6 +25,7 @@ from ..frameworks import FrameworkOpBase, TensorBase
 from ..st_types import Device, DeviceType, DType
 from .base import (
     CopierInterface,
+    reject_spyre_device,
     validated_byte_ranges,
     validated_chunk_allocation_size,
 )
@@ -74,6 +75,10 @@ def _fd_is_odirect(fd: int) -> bool:
         return bool(fcntl.fcntl(fd, fcntl.F_GETFL) & o_direct)
     except OSError:
         return False
+
+# Largest read request for a host destination; measured on page-cached files,
+# 256 MiB requests read ~2.7x faster than whole-file ones (16 threads).
+_HOST_READ_BLOCK_BYTES = 256 << 20
 
 
 class NoGdsFileCopier(CopierInterface):
@@ -217,6 +222,8 @@ class NoGdsFileCopier(CopierInterface):
             alloc_length = self.metadata.size_bytes - header_length
         self._base_off = base_off
         gbuf = self.framework.alloc_tensor_memory(alloc_length, self.device)
+        if self.device.type == DeviceType.CPU:
+            max_copy_block_size = min(max_copy_block_size, _HOST_READ_BLOCK_BYTES)
         try:
             for start, end in runs:
                 count = start
@@ -341,6 +348,7 @@ def new_nogds_file_copier(
     max_threads: int = 16,
     **kwargs,
 ) -> CopierConstructFunc:
+    reject_spyre_device(device, "nogds")
     load_library_func(kwargs.get("framework"))
     device_is_not_cpu = device.type != DeviceType.CPU
     if device_is_not_cpu and not is_gpu_found():

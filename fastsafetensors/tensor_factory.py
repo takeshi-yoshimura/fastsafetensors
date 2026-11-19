@@ -33,8 +33,10 @@ class LazyTensorFactory:
         copier: Optional[CopierInterface],
         framework: FrameworkOpBase,
         disable_cache=True,
+        device_native: bool = False,
     ):
         self.framework = framework
+        self.device_native = device_native
         self.metadata = metadata
         self.device = device
         self.copier: Optional[CopierInterface] = None
@@ -251,6 +253,11 @@ class LazyTensorFactory:
     def shuffle_multi_cols(
         self, pg: ProcessGroupBase, tensor_names: List[str], dim: int
     ) -> TensorBase:
+        if self.device_native:
+            raise ValueError(
+                "device-native tensors are in a device-specific format and "
+                "cannot be sliced or concatenated"
+            )
         rank_tensors: List[List[TensorBase]] = [[] for i in range(0, pg.size())]
         new_shape: List[int] = []
         rank_sizes = [0] * pg.size()
@@ -373,7 +380,11 @@ class LazyTensorFactory:
         """
         try:
             if self.copier is not None:
-                if self.wait_tensor is None and self.gbuf is not None:
+                if (
+                    self.wait_tensor is None
+                    and self.gbuf is not None
+                    and not self.device_native
+                ):
                     # A later file can fail before this blocking copier's
                     # wait_io was reached. Drain its writes before cleanup.
                     self.copier.wait_io(self.gbuf, noalign=True)

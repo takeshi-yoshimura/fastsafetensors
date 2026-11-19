@@ -250,7 +250,11 @@ class PipelineParallel:
         self.borrowed_tensors = borrowed_tensors
         # Preserve independent outputs and the existing clone budget by default.
         # Only an explicit borrowed mode exports the raw loader storage.
-        self.need_clone = pg.size() == 1 and not borrowed_tensors
+        self.need_clone = (
+            pg.size() == 1
+            and not borrowed_tensors
+            and not loader.tensors_own_storage
+        )
         if broadcast_run_bytes < 0 or broadcast_run_tensors < 0:
             raise ValueError("broadcast run limits must be non-negative")
         self.broadcast_run_bytes = broadcast_run_bytes
@@ -956,6 +960,7 @@ class ParallelLoader(PipelineParallel):
         # Appended after the existing explicit parameters so callers using
         # positional arguments keep working.
         tensor_slices: Optional[Dict[str, slice]] = None,
+        copier_type: Optional[str] = None,
         **kwargs,
     ):
         """Initialize PipelineParallelLoader with a pre-configured SafeTensorsFileLoader.
@@ -975,6 +980,8 @@ class ParallelLoader(PipelineParallel):
             debug_log (bool): Enable debug logs.
             framework (str): Framework to use for tensor operations.
             use_fgds (bool): If True, use FGDS instead of cuFile GDS.
+            copier_type (Optional[str]): Copier to use instead of the one nogds/use_fgds
+                select, e.g. the Spyre-native copier.
         """
         # all_local: load with a single-process group so each rank reads its
         # files independently (no cross-rank broadcast in get_tensor). This is
@@ -993,6 +1000,7 @@ class ParallelLoader(PipelineParallel):
             framework=framework,
             use_fgds=use_fgds,
             device_memory_budget=device_memory_budget,
+            copier_type=copier_type,
             **kwargs,
         )
         super().__init__(

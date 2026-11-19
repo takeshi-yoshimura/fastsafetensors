@@ -854,9 +854,9 @@ struct nogds_file_reader::state {
         int fd;
         uintptr_t destination;
         int64_t offset, length, next = 0;
-        uint64_t remaining, prefix = 0;
+        uint64_t remaining, prefix = 0, block_size = 0;
         std::vector<uint8_t> completed;
-        bool failed = false;
+        bool failed = false, direct_cpu = false;
 #ifndef _MSC_VER
         // Worker-private descriptors for this request when the reader was built with
         // fd_per_thread: -2 = not opened yet, -1 = reopen failed (use fd). Closed as
@@ -932,6 +932,20 @@ struct nogds_file_reader::state {
     void read(const request &req, int fd, int64_t position, int64_t length,
               char *bounce, cudaStream_t stream) {
         const int64_t offset = req.offset + position;
+#ifndef _MSC_VER
+        const int flags = fcntl(fd, F_GETFL);
+        if (req.direct_cpu || (fns == &cpu_fns && !use_mmap && flags >= 0 && !(flags & O_DIRECT))) {
+            int64_t done = 0;
+            while (done < length) {
+                void *destination = reinterpret_cast<void *>(req.destination + position + done);
+                const int64_t got = pread(fd, destination, length - done, offset + done);
+                if (got < 0 && errno == EINTR) continue;
+                if (got <= 0) throw std::runtime_error("nogds read failed or truncated input");
+                done += got;
+            }
+            return;
+        }
+#endif
         int64_t source_skip = 0;
         if (use_mmap) {
 #ifdef _MSC_VER
@@ -1012,7 +1026,7 @@ struct nogds_file_reader::state {
             req->failed |= failed;
             const uint64_t old_prefix = req->prefix;
             if (!req->completed.empty() && !failed) {
-                req->completed[position / block_size] = 1;
+                req->completed[position / req->block_size] = 1;
                 // Workers can finish out of order. Publish only a contiguous prefix
                 // whose DMA has completed, never merely scheduled bytes.
                 while (req->prefix < req->completed.size() && req->completed[req->prefix])
@@ -1059,7 +1073,7 @@ struct nogds_file_reader::state {
                 if (queue.empty()) break;
                 req = queue.front();
                 position = req->next;
-                length = std::min<int64_t>(block_size, req->length - position);
+                length = std::min<int64_t>(req->block_size, req->length - position);
                 req->next += length;
                 if (req->next == req->length) queue.pop_front();
             }
@@ -1171,7 +1185,16 @@ const int nogds_file_reader::submit_read(int fd, const gds_device_buffer &dst,
     auto req = std::make_shared<state::request>();
     req->fd = fd; req->destination = dst.get_base_address() + ptr_off;
     req->offset = offset; req->length = length;
-    req->remaining = length ? (length - 1) / s.block_size + 1 : 0;
+    req->block_size = s.block_size;
+#ifndef _MSC_VER
+    const int flags = fcntl(fd, F_GETFL);
+    req->direct_cpu = s.fns == &cpu_fns && !s.use_mmap && !track_progress
+        && flags >= 0 && !(flags & O_DIRECT);
+    // Buffered CPU reads write straight into the caller's storage. They do not
+    // use bounce slots, so tiny GPU staging budgets must not produce tiny preads.
+    if (req->direct_cpu) req->block_size = std::max<uint64_t>(s.block_size, 4ULL << 20);
+#endif
+    req->remaining = length ? (length - 1) / req->block_size + 1 : 0;
     if (track_progress) req->completed.resize(req->remaining, 0);
     int id;
     {
@@ -1193,10 +1216,10 @@ const uint64_t nogds_file_reader::wait_read_prefix(int id, uint64_t length) {
         throw std::out_of_range("read prefix out of bounds");
     if (req->length && req->completed.empty())
         throw std::invalid_argument("read progress was not enabled");
-    const uint64_t blocks = length ? (length - 1) / s.block_size + 1 : 0;
+    const uint64_t blocks = length ? (length - 1) / req->block_size + 1 : 0;
     s.done.wait(lock, [&] { return req->failed || req->prefix >= blocks; });
     if (req->failed) throw std::runtime_error("nogds read failed or truncated input");
-    return std::min<uint64_t>(req->length, req->prefix * s.block_size);
+    return std::min<uint64_t>(req->length, req->prefix * req->block_size);
 }
 
 const uintptr_t nogds_file_reader::wait_read(int id) {

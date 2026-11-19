@@ -13,6 +13,7 @@ from ..frameworks import FrameworkOpBase, TensorBase
 from ..st_types import Device, DeviceType, DType
 from .base import (
     CopierInterface,
+    reject_spyre_device,
     validated_byte_ranges,
     validated_chunk_allocation_size,
 )
@@ -449,6 +450,7 @@ def new_gds_file_copier(
     device_memory_budget: Optional[int] = None,
     **kwargs,
 ) -> CopierConstructFunc:
+    reject_spyre_device(device, "gds")
     framework = kwargs.get("framework")
     # Capability checks depend on symbols resolved by load_library_func().
     load_library_func(framework)

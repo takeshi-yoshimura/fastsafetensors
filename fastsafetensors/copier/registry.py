@@ -29,6 +29,15 @@ def register_copier_constructor(
     ``copier_class_of``.
     """
 
+    if (
+        copier_class is not None
+        and copier_class.device_native
+        and not copier_class.owns_tensor_storage
+    ):
+        raise ValueError(
+            f"{copier_class.__name__}: device_native copiers must own their tensors"
+        )
+
     def decorator(factory_func: CopierConstructorFactory) -> CopierConstructorFactory:
         @functools.wraps(factory_func)
         def factory(*args: Any, **kwargs: Any) -> CopierConstructFunc:
