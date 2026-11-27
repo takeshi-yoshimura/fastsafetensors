@@ -257,6 +257,13 @@ class TorchProcessGroup(ProcessGroupBase[TorchTensor]):
 
 
 class TorchOp(FrameworkOpBase[TorchTensor, TorchProcessGroup]):
+    def get_native_ops(self, device: Device):
+        if device.type == DeviceType.SPYRE:
+            from ._torch_spyre import TorchSpyreOp
+
+            return TorchSpyreOp(self, device)
+        return super().get_native_ops(device)
+
     def synchronize_current_stream(self, device: Device) -> None:
         if device.type == DeviceType.CUDA:
             torch.cuda.current_stream(device.as_str()).synchronize()
@@ -314,14 +321,28 @@ class TorchOp(FrameworkOpBase[TorchTensor, TorchProcessGroup]):
         return "pytorch"
 
     def get_device(self, device: str, pg: TorchProcessGroup) -> Device:
+        parsed = Device.from_str(str(device))
+        if parsed.type == DeviceType.SPYRE:
+            return parsed
         dev = torch.device(device)
         return Device(DeviceType(dev.type), dev.index)
 
     def set_device(self, device: Device) -> None:
-        if device.type != DeviceType.CPU:
+        if device.type == DeviceType.SPYRE:
+            import torch_spyre  # noqa: F401 -- registers torch.spyre
+
+            if device.index is not None:
+                torch.spyre.set_device(device.index)  # type: ignore[attr-defined]
+        elif device.type != DeviceType.CPU:
             torch.cuda.set_device(device.as_str())
 
     def alloc_tensor_memory(self, length: int, dev: Device) -> gds_device_buffer:
+        if dev.type == DeviceType.SPYRE:
+            raise NotImplementedError(
+                "Spyre requires a device-native copier: data_ptr is an opaque "
+                "handle, not a byte-addressable buffer; use get_empty_tensor "
+                "or get_native_ops for tensor-owned allocation"
+            )
         if dev.type == DeviceType.CUDA:
             rbuf = torch.cuda.caching_allocator_alloc(length)
         else:
@@ -330,6 +351,8 @@ class TorchOp(FrameworkOpBase[TorchTensor, TorchProcessGroup]):
         return gds_device_buffer(rbuf, length, dev.type == DeviceType.CUDA)
 
     def free_tensor_memory(self, gbuf: gds_device_buffer, dev: Device):
+        if dev.type == DeviceType.SPYRE:
+            raise NotImplementedError("Spyre requires a device-native copier")
         length = gbuf.get_length()
         if dev.type == DeviceType.CUDA:
             torch.cuda.caching_allocator_delete(gbuf.get_base_address())
@@ -538,7 +561,11 @@ class TorchOp(FrameworkOpBase[TorchTensor, TorchProcessGroup]):
         return tuple(native_slices)
 
     def synchronize(self, device: Device) -> None:
-        if device.type != DeviceType.CPU and torch.cuda.is_available():
+        if device.type == DeviceType.SPYRE:
+            from torch_spyre._C import synchronize
+
+            synchronize(torch.device(device.as_str()))
+        elif device.type != DeviceType.CPU and torch.cuda.is_available():
             torch.cuda.synchronize()
 
     def get_global_rank(self) -> int:

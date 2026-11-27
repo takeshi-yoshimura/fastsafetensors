@@ -2,7 +2,16 @@
 
 import operator
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    ClassVar,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+)
 
 from .. import cpp as fstcpp
 from ..common import SafeTensorsMetadata, is_gpu_found, resolve_runtime_lib_name
@@ -114,6 +123,13 @@ def validated_chunk_allocation_size(
 class CopierInterface(ABC):
     metadata: SafeTensorsMetadata
 
+    def validate_io(self) -> None:
+        """Preflight the selected tensors before any file starts IO.
+
+        Must not allocate destinations, read payloads or submit transfers.
+        Submission still validates resources created after this preflight.
+        """
+
     def enable_tensor_readiness(self) -> bool:
         """Opt into view creation during IO and tensor-specific DMA waits.
 
@@ -133,6 +149,23 @@ class CopierInterface(ABC):
 
     def finish_io(self) -> None:
         """Drain all inflight writes before buffer or file descriptor release."""
+
+    # The tensors wait_io returns own their storage instead of viewing the gbuf,
+    # so they outlive FilesBufferOnDevice.close() and need no clone on yield.
+    owns_tensor_storage: ClassVar[bool] = False
+    # The tensors are in an opaque device-specific format (e.g. Spyre's
+    # layout): no slicing, dtype conversion or collectives may touch them.
+    # Implies owns_tensor_storage.
+    device_native: ClassVar[bool] = False
+
+    def select_tensors(self, keep: Callable[[str], bool]) -> None:
+        """Load only the tensors ``keep`` accepts.
+
+        The default reads the byte runs covering them (``set_byte_ranges``),
+        which may include neighbours; copiers that need the exact names (e.g.
+        to allocate one destination per tensor) override this.
+        """
+        self.set_byte_ranges(self.metadata.select_byte_ranges(keep))
 
     def set_byte_ranges(self, byte_ranges: Optional[List[Tuple[int, int]]]) -> None:
         """Restrict reads to these ``[start, end)`` absolute file-offset runs.

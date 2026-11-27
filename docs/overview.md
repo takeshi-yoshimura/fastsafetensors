@@ -211,3 +211,152 @@ The fallback resolves a framework-bundled CUDA runtime first (for example,
 PyTorch's `torch\lib` directory), then checks system CUDA Toolkit locations.
 `FASTSAFETENSORS_CUDART_LIB` can specify an absolute runtime DLL explicitly and
 takes precedence over automatic discovery.
+
+
+Experimental Spyre-native checkpoints
+-------------------------------------
+
+`copier_type="spyre"` loads experimental `spyre.native.v1` checkpoints through
+tensor-owned storage and a two-slot pinned pipeline. It requires PyTorch,
+torch-spyre's buffer APIs and a single-process loader group
+(`ParallelLoader(all_local=True)`). Native outputs cannot be sliced, cast or used
+in collectives. CPU loading and fastsafetensors builds need no Spyre dependencies.
+
+### Format and admission
+
+`spyre.native.v1` is an experimental candidate, not an upstream safetensors
+standard. Special values, rounding and cross-SDK compatibility are not yet
+qualified; do not assume portable cached artifacts.
+
+```json
+{
+  "profile": "spyre.native.v1",
+  "spyre.overrides": "{\"tensors\":{\"weight\":{\"logical_shape\":[128,150],\"logical_dtype\":\"F16\"}}}"
+}
+```
+
+Every tensor in a profiled shard is a `U8 [nbytes]` carrier with an exact storage
+key in `spyre.overrides`. Ordinary tensors belong in separate unprofiled files;
+additional application metadata may coexist. No URL, plugin, executable recipe,
+arbitrary stride or runtime layout dump is accepted. Legacy `fst.native.*`
+metadata must be regenerated, not reinterpreted.
+
+`logical_shape` is required. Defaults are BF16, `dlfloat16` and `stick-last.v1`;
+FP16 therefore records `logical_dtype="F16"`. FP32/`ieee-fp32` and I32/`int32`
+are also admitted. I64 is not: on the tested runtime, allocation/DMA size disagrees
+with the derived I32 payload for widths such as 65. I64, BOOL, FP8/QFP8WT, empty
+tensors and other layouts stay portable and use the framework copy path.
+
+Optional `target={"tp_size":N,"tp_rank":R}` identifies an already-prepared rank;
+omission means TP1/rank0. These fields never request slicing. Pass matching
+`tp_size`/`tp_rank` to the loader. Model-level identity policy belongs to the caller.
+
+Limits are 16 logical axes, extents 1..2^31-1, 4 GiB per native tensor, 100,000
+tensors per shard and 1 TiB aggregate native bytes per load plan. Strict JSON
+decoding rejects duplicate keys, non-finite numbers, over 32 nesting levels,
+keys over 4096 UTF-8 bytes, native metadata over 16 MiB and headers over
+100,000,000 bytes. Schema, carriers, target and aggregate budget are checked
+across the load plan before device allocation or DMA.
+
+### Fixed geometry
+
+Each stick is 128 bytes (64 DLFloat16 lanes or 32 FP32/I32 lanes). The logical
+last axis splits into outer sticks and inner lanes. Physical axes are
+`[logical axis 1, ..., last outer-stick axis, logical axis 0, lane]` for rank >=2;
+rank1 is `[outer stick, lane]`. Scalars occupy one stick. Singleton logical axes
+have zero runtime stride-map entries; logical strides are canonical dense strides.
+For `[128,150]` with DLFloat16, physical size is `[3,128,64]`, totaling 49,152 bytes,
+not row-major `[128,192]`.
+
+`tests/spyre/test_profile_conformance.py` compares derived/runtime layouts,
+independently packs FP32/I32 fixtures, checks padding with two initializations and
+round-trips admitted dtypes. DLFloat16 is not IEEE FP16/BF16. The tested runtime
+passes finite fixtures `0, 1, -1, 0.5, 2, 1.5, -2`, including `1 = 0x3e00`
+little-endian. Special values, rounding, overflow and underflow remain unqualified;
+this is not a frozen interchange contract without those tests and SDK/DSO identities.
+
+### Framework and transfer ownership
+
+The Python adapter owns Tensor validation, allocation, storage handles and layout
+JSON helpers. The copier uses `TensorBase`. fastsafetensors has no Torch, backend,
+Flex or deeptools build dependency. The backend supplies two buffer functions:
+`copy_buffer_ranges([(source, address_handle, physical_offset, length)], stream=...)`
+and `convert_buffers([(output, input, logical_shape, dtype)])`.
+
+Loading uses buffered `preadv` and two `pin_memory=True` slots. `bbuf_size_kb`
+is their total exposed capacity (default 16 MiB), rounded down to two page-aligned
+slots; at least two pages are required. Backing-cache over-allocation and idle
+retention are not bounded by this setting. Pageable sources are rejected, not
+staged. Export length and backing capacity are checked separately.
+
+DMA uses physical byte ranges and the caller's captured stream. The reader
+enqueues up to two owning tickets before waiting; single/tail work progresses
+without `wait_read()`. Slots become reusable only after completion is proved.
+Direct `copy_raw_tensors()` remains blocking. Existing stream-wide synchronization
+may complete later work too; each ticket retains its exports, pinned storage,
+destination handles and stream until its completion is checked. This binding holds
+the GIL, so actual overlap/performance is not qualified.
+
+Cancel/close drain started work. Partial enqueue failure with a successful drain
+raises `TransferDrainedError` without poisoning. Unknown completion quarantines
+owners for process lifetime and poisons future copies; remaining tickets retain
+owners without synchronizing again. Restart the process, never retry/reset or
+replace libraries. Metadata and selected destinations are preflighted across files
+before I/O; later resource/submission failures still require drain.
+
+Use one device per process and handles/mappings from the same process, device and
+live runtime. Creation PID/device/runtime generation and storage identity are not
+exposed or automatically checked. Inherited/stale objects are forbidden. Never
+resize/rebind storage with a live handle, mutate storage before DMA completion,
+or reset/tear down a runtime with live handles/mappings/work. Storage ownership
+does not protect against caller mutation.
+
+Conversion accepts little-endian dense input, outermost-first logical shapes and
+F16/BF16/F32/I32 dtype names. The backend derives the standard layout (DLFloat16 for
+F16/BF16); callers do not construct physical shapes or SDK descriptors. Conversion
+is synchronous on the calling thread with the GIL released; callers choose
+parallelism across independent calls. Fixed-profile tile/output planning remains
+in the loader. Compact read/cast tensors are each <= `workspace_bytes` and may
+coexist; no device Tensor is allocated. Output mmaps/page cache are outside that
+budget. Single-chunk base allocations are limited to 4 GiB; automatic
+`device_memory_budget` planning is unsupported. Older backends fail explicitly,
+with no whole-tensor fallback.
+
+### Standalone conversion and loading
+
+The [standalone example](../examples/load_spyre.py) needs PyTorch, torch-spyre's
+two buffer APIs and the matching SDK, but not spyre-inference, vLLM or Transformers.
+It does not patch installed libraries. Build fastsafetensors normally with
+`python -m pip install .`; source weights must already be local.
+
+```bash
+python examples/load_spyre.py convert /path/to/gemma-snapshot /output/gemma/model \
+  --device spyre:0 --dtype F16 --num-shards 16 --workspace-bytes 8388608
+
+python examples/load_spyre.py load /output/gemma --device spyre:0 \
+  --host-buffer-mib 16 --batch-mib 3072 --verify-source /path/to/gemma-snapshot
+```
+
+`fastsafetensors.native.convert_to_spyre()` accepts a safetensors file, an HF index
+or a directory (including snapshot symlinks). It preserves names/shapes and writes
+to new paths, atomically **per shard**, not across the set. Floating-point input
+becomes **FP16 by default**, including BF16 weights. No architecture/TP transform,
+fusion or quantization is performed. Sequential compact read/cast tiles are each
+bounded by `workspace_bytes` (default 8 MiB, minimum 512 bytes; both may coexist),
+including wide rows. Conversion performs no DMA. Output mappings/page cache are
+**not an RSS limit** and are separate from this workspace and loader slots.
+
+The `load` command uses `ParallelLoader` and releases weights after each delivery
+chunk, so models larger than one card can be checked. `--batch-mib` must fit the
+largest whole tensor. `--verify-source` checks every logical value against an
+independent normal torch-spyre CPU-to-device-to-CPU copy, accounting for backend
+rounding; omit it to load without comparison. This is not a performance benchmark.
+Use `ParallelLoader` directly and retain tensors when integrating into a model.
+`max_threads` bounds parallel `preadv`; `max_copy_block_size` limits each syscall.
+
+Optional hardware tests (not CPU qualification):
+
+```bash
+TEST_FASTSAFETENSORS_FRAMEWORK=pytorch TEST_FASTSAFETENSORS_SPYRE=1 \
+  python -m pytest -q tests/spyre
+```

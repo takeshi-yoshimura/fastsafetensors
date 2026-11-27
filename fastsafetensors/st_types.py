@@ -7,14 +7,20 @@ from typing import Optional
 
 class DeviceType(Enum):
     CPU = "cpu"
+    META = "meta"
     CUDA = "cuda"
     GPU = "gpu"
+    SPYRE = "spyre"
 
 
 @dataclass(frozen=True)
 class Device:
     type: DeviceType = DeviceType.CPU
     index: Optional[int] = None
+
+    @property
+    def is_gpu(self) -> bool:
+        return self.type in (DeviceType.CUDA, DeviceType.GPU)
 
     def as_str(self) -> str:
         if self.index is None:

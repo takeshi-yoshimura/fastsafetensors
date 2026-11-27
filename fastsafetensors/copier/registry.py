@@ -42,6 +42,15 @@ def register_copier_constructor(
     run ``select_copier`` first to load, initialize and resolve the backend.
     """
 
+    if (
+        copier_class is not None
+        and copier_class.device_native
+        and not copier_class.owns_tensor_storage
+    ):
+        raise ValueError(
+            f"{copier_class.__name__}: device_native copiers must own their tensors"
+        )
+
     def decorator(factory_func: CopierConstructorFactory) -> CopierConstructorFactory:
         @functools.wraps(factory_func)
         def factory(*args: Any, **kwargs: Any) -> CopierConstructFunc:
@@ -114,6 +123,21 @@ def load_and_init_and_check_copier(
 
 def select_copier(copier_type: CopierType, device: Device, **kwargs) -> CopierType:
     """Resolve the final backend before constructing any copier resources."""
+    if device.type == DeviceType.META:
+        raise ValueError(
+            "meta is a tensor description, not a checkpoint load destination"
+        )
+    if device.type == DeviceType.SPYRE and copier_type in (
+        "gds",
+        "nogds",
+        "fgds",
+        "unified",
+        "dstorage",
+    ):
+        raise ValueError(
+            f"copier '{copier_type}' cannot load onto Spyre device "
+            f"'{device.as_str()}'; use copier_type='spyre'"
+        )
     if load_and_init_and_check_copier(copier_type, device, **kwargs):
         return copier_type
     if copier_type == "gds":

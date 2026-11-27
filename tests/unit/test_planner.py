@@ -93,10 +93,9 @@ def test_chunk_transient_multiplier_default_refuses():
 
 
 def test_chunking_copiers_declare_their_transient_cost():
-    # The two overrides have to travel together: a copier that implements
-    # set_chunk but inherits the refusing default would be rejected by
-    # device_memory_budget despite being able to chunk, and one that declares
-    # a cost without implementing set_chunk would be planned for and then fail.
+    # Byte copiers' chunking and device-cost declarations travel together.
+    # Native copiers may support whole-tensor chunks without a byte-derived
+    # device budget; they must explicitly reject that planner, never guess.
     from fastsafetensors.copier import CopierInterface, get_copier_class
     from fastsafetensors.copier.registry import _copier_class_registry
 
@@ -109,6 +108,11 @@ def test_chunking_copiers_declare_their_transient_cost():
         cls = get_copier_class(name)
         assert cls is registered is not CopierInterface, name
         chunks = cls.set_chunk is not CopierInterface.set_chunk
+        if name == "spyre":
+            assert chunks
+            with pytest.raises(NotImplementedError, match="Spyre device_memory_budget"):
+                cls.chunk_transient_multiplier(["f0", "f1"])
+            continue
         # chunk_transient_multiplier is a classmethod: attribute access builds
         # a fresh bound method every time, so compare the underlying functions.
         declares = (

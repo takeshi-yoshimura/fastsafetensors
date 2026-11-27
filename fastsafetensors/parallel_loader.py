@@ -250,7 +250,9 @@ class PipelineParallel:
         self.borrowed_tensors = borrowed_tensors
         # Preserve independent outputs and the existing clone budget by default.
         # Only an explicit borrowed mode exports the raw loader storage.
-        self.need_clone = pg.size() == 1 and not borrowed_tensors
+        self.need_clone = (
+            pg.size() == 1 and not borrowed_tensors and not loader.tensors_own_storage
+        )
         if broadcast_run_bytes < 0 or broadcast_run_tensors < 0:
             raise ValueError("broadcast run limits must be non-negative")
         self.broadcast_run_bytes = broadcast_run_bytes
@@ -315,6 +317,18 @@ class PipelineParallel:
         # A new pipeline must not inherit headers from a previous load, even
         # when it uses the same underlying loader without sub-file chunking.
         self.loader._set_metadata_cache({})
+        validate_metadata = getattr(
+            self.loader.copier_constructor, "validate_metadata", None
+        )
+        if "validate_metadata" in getattr(
+            self.loader.copier_constructor, "__dict__", {}
+        ) and callable(validate_metadata):
+            admitted_metas = {
+                f: SafeTensorsMetadata.from_file(f, self.loader.framework)
+                for f in dict.fromkeys(self.hf_weights_files)
+            }
+            validate_metadata(list(admitted_metas.values()))
+            self.loader._set_metadata_cache(admitted_metas)
         file_batches = [
             self.hf_weights_files[i : i + batch_size]
             for i in range(0, len(self.hf_weights_files), batch_size)

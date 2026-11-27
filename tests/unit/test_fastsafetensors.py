@@ -197,7 +197,7 @@ def test_from_buffer_invalid_header_length(monkeypatch, framework):
 
 
 def test_from_buffer_success(monkeypatch, framework):
-    json_str = '{"__metadata__": {"data_offsets": [0, 123]}}'
+    json_str = '{"__metadata__": {"application": "value"}}'
     header_bytes = make_header_bytes(json_str)
     buf_data = header_bytes
 

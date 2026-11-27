@@ -123,11 +123,23 @@ class BaseSafeTensorsFileLoader:
         self.copier_class: Type[CopierInterface] = copier_class_of(
             self.copier_constructor
         )
+        # Whether loaded tensors outlive their FilesBufferOnDevice, so callers
+        # need not clone them.
+        self.tensors_own_storage: bool = self.copier_class.owns_tensor_storage
+        if self.copier_class.device_native and self.pg.size() > 1:
+            raise ValueError(
+                f"device-native copier '{copier_type}' needs a single-process "
+                f"loader group (pg=None, or ParallelLoader(all_local=True)): its "
+                f"tensors cannot be broadcast or scattered"
+            )
 
     def init_numa(self, set_numa: bool = True):
         global gl_set_numa
         if not gl_set_numa and set_numa:
-            node = get_device_numa_node(self.device.index)
+            if self.device.type == DeviceType.SPYRE:
+                node = None
+            else:
+                node = get_device_numa_node(self.device.index)
             if node is not None:
                 fstcpp.set_numa_node(node)
             gl_set_numa = True
@@ -221,6 +233,8 @@ class BaseSafeTensorsFileLoader:
             if self._tensor_slices.pop(tensor_name, None) is not None:
                 self._apply_slices()
             return
+        if self.copier_class.device_native:
+            raise ValueError("device-native tensors cannot be sliced")
         if not isinstance(selection, slice):
             raise TypeError(f"set_slice: selection must be a slice, got {selection!r}")
         if selection.step not in (None, 1):
@@ -359,6 +373,17 @@ class BaseSafeTensorsFileLoader:
                     f"set_slice: no registered tensor named {unknown}; call "
                     "set_slice with a tensor present in the input files"
                 )
+        device_native = self.copier_class.device_native
+        if device_native and dtype != DType.AUTO:
+            raise ValueError(
+                "device-native tensors are in a device-specific format; "
+                "dtype conversion is not supported"
+            )
+        validate_metadata = getattr(self.copier_constructor, "validate_metadata", None)
+        if "validate_metadata" in getattr(
+            self.copier_constructor, "__dict__", {}
+        ) and callable(validate_metadata):
+            validate_metadata([meta for meta, _rank in self.meta.values()])
         self.framework.set_device(self.device)
 
         if dtype != DType.AUTO:
@@ -374,6 +399,7 @@ class BaseSafeTensorsFileLoader:
 
         factory_idx_bits = math.ceil(math.log2(len(self.meta) + 1))
         lidx = 1
+        configured: List[LazyTensorFactory] = []
         try:
             for realpath, (meta, rank) in sorted(self.meta.items(), key=lambda x: x[0]):
                 self_rank = self.pg.rank() == rank
@@ -391,6 +417,7 @@ class BaseSafeTensorsFileLoader:
                     copier,
                     self.framework,
                     disable_cache=self.disable_cache,
+                    device_native=device_native,
                 )
                 # Register ownership before configuring the copier: set_chunk
                 # and set_byte_ranges can fail after it has opened a file.
@@ -427,17 +454,22 @@ class BaseSafeTensorsFileLoader:
                         ranges = meta.select_byte_ranges(lambda n: n in kept)
                         copier.set_chunk(ranges, kept)
                     elif self._tensor_filter is not None:
-                        copier.set_byte_ranges(
-                            meta.select_byte_ranges(self._tensor_filter)
-                        )
+                        copier.select_tensors(self._tensor_filter)
+                    validate_io = getattr(copier, "validate_io", None)
+                    if callable(validate_io):
+                        validate_io()
+                configured.append(factory)
+                lidx += 1
+            # All selected-file preflights must finish before the first worker
+            # can start: a later destination mismatch must not race earlier DMA.
+            for factory in configured:
                 factory.submit_io(
                     use_buf_register,
                     max_copy_block_size,
                     allow_inflight=allow_inflight and dtype == DType.AUTO,
                 )
-                if self_rank:
+                if factory.rank == self.pg.rank():
                     need_wait.append(factory)
-                lidx += 1
             for factory in need_wait:
                 factory.wait_io(
                     dtype=dtype, noalign=False, borrowed_tensors=borrowed_tensors
@@ -464,6 +496,7 @@ class BaseSafeTensorsFileLoader:
             framework=self.framework,
             keep_tensor=keep_tensor,
             borrowed_tensors=borrowed_tensors,
+            device_native=device_native,
         )
 
 
@@ -509,11 +542,11 @@ class SafeTensorsFileLoader(BaseSafeTensorsFileLoader):
         self.device = self.framework.get_device(device, self.pg)
 
         fstcpp.set_debug_log(debug_log)
+        if copier_type is None and self.device.type == DeviceType.SPYRE:
+            copier_type = "spyre"
         if copier_type is None:
             if nogds:
-                if self.device.type != DeviceType.CPU and is_unified_memory_system(
-                    self.framework
-                ):
+                if self.device.is_gpu and is_unified_memory_system(self.framework):
                     # When GDS is unavailable, prefer the unified copier on systems
                     # with shared CPU/GPU memory (e.g., DGX Spark) over the
                     # bounce-buffer nogds path.

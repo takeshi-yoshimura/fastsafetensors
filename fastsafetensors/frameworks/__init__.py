@@ -5,10 +5,12 @@ from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Generic,
     Iterator,
     List,
     Optional,
+    Protocol,
     Set,
     Tuple,
     TypeVar,
@@ -91,6 +93,39 @@ class TensorBase:
 T = TypeVar("T", bound=TensorBase)
 
 
+class TransferDrainedError(RuntimeError):
+    """A failed copy whose started transfers have all demonstrably completed."""
+
+
+class HostTransfer(Protocol):
+    """Retain pending owners even if dropped; failed waits quarantine, never retry."""
+
+    def wait(self) -> None: ...
+
+
+class HostTransferOp(Protocol):
+    """Framework boundary for physical-byte-range host-to-device transfers.
+
+    prepare_copy captures the caller's device/stream and returns an owning ticket
+    (None if already complete). Slots are reusable only after wait. Enqueue errors
+    must drain partial submissions or quarantine owners.
+    """
+
+    def allocate_host_buffer(self, nbytes: int) -> TensorBase: ...
+
+    def transfer_alignment(self) -> int: ...
+
+    def host_buffer_view(self, tensor: TensorBase) -> memoryview: ...
+
+    def validate_transfer(self, tensor: TensorBase, device: Device) -> int: ...
+
+    def prepare_copy(
+        self, device: Device
+    ) -> Callable[
+        [list[tuple[TensorBase, TensorBase, int, int]]], HostTransfer | None
+    ]: ...
+
+
 class ProcessGroupBase(ABC, Generic[T]):
     @abstractmethod
     def size(self) -> int:
@@ -136,6 +171,17 @@ K = TypeVar("K", bound=ProcessGroupBase)
 
 
 class FrameworkOpBase(ABC, Generic[T, K]):
+    def get_native_ops(self, device: Device) -> Any:
+        """Return framework-owned operations for an opaque device tensor format.
+
+        Unlike alloc_tensor_memory, these operations retain tensor storage and
+        device layout rather than exposing a byte-addressable device pointer.
+        Optional backends are imported only when the operations are requested.
+        """
+        raise NotImplementedError(
+            f"{self.get_name()}: native tensor operations for {device.as_str()}"
+        )
+
     def broadcast_contiguous_run(
         self,
         pg: K,
