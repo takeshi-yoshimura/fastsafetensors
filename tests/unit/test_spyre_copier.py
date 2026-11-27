@@ -34,8 +34,8 @@ class _FakeNativeCopier(CopierInterface):
         self.framework = framework
         self.names: Optional[List[str]] = None
 
-    def select_tensors(self, keep):
-        self.names = [n for n in self.metadata.tensors if keep(n)]
+    def set_chunk(self, byte_ranges, names, allocation_size=None):
+        self.names = [n for n in self.metadata.tensors if n in names]
 
     def submit_io(self, use_buf_register, max_copy_block_size):
         import torch
@@ -463,7 +463,7 @@ def emulated_spyre(monkeypatch, framework):
     return state
 
 
-def _native_files(tmp_path, *, fmt=None, moved=None, num_shards=2):
+def _native_files(tmp_path, *, fmt=None, moved=None, num_shards=2, extra_native=False):
     import torch
 
     from fastsafetensors.copier.spyre import NATIVE_FORMAT
@@ -480,6 +480,8 @@ def _native_files(tmp_path, *, fmt=None, moved=None, num_shards=2):
         "b": torch.arange(4, dtype=torch.float32).reshape(2, 2),
         "plain": torch.arange(3, dtype=torch.float32),
     }
+    if extra_native:
+        tensors["c"] = torch.arange(8, dtype=torch.float32).reshape(2, 4) + 10
     if moved is not None:
         tensors["kept"] = torch.arange(2, dtype=torch.float32)
     entries = []
@@ -569,6 +571,73 @@ def test_real_copier_reads_shards_and_preserves_destinations(
     assert sum(map(len, emulated_spyre.batches)) == (1 if filtered else 2)
     assert all(len(batch) == 1 for batch in emulated_spyre.batches)
     assert len(emulated_spyre.allocated) == (0 if filtered else 1)
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("selected", [{"a", "c"}, set()])
+def test_loader_selection_uses_exact_names_not_coalesced_ranges(
+    emulated_spyre, tmp_path, monkeypatch, chunked, selected
+):
+    import torch
+
+    from fastsafetensors.copier import host
+    from fastsafetensors.copier.spyre import SpyreCopier
+
+    paths, expected = _native_files(tmp_path, num_shards=1, extra_native=True)
+    loader = SafeTensorsFileLoader(None, "spyre:0", set_numa=False)
+    loader.add_filenames({0: paths})
+    plans, reads = {}, []
+    set_chunk = SpyreCopier.set_chunk
+    pread = host.pread_into
+
+    def record_plan(self, ranges, names, allocation_size=None):
+        plans[self.metadata.src] = (ranges, set(names))
+        set_chunk(self, ranges, names, allocation_size)
+
+    def record_read(fd, buffer, offset):
+        reads.append((offset, len(buffer)))
+        pread(fd, buffer, offset)
+
+    monkeypatch.setattr(SpyreCopier, "set_chunk", record_plan)
+    monkeypatch.setattr(host, "pread_into", record_read)
+    if chunked:
+        loader._set_chunk_plan(
+            {
+                path: (
+                    selected & meta.tensors.keys(),
+                    meta.select_byte_ranges(selected.__contains__),
+                    None,
+                )
+                for path, (meta, _) in loader.meta.items()
+            }
+        )
+    else:
+        loader.set_tensor_filter(selected.__contains__)
+    try:
+        loaded = loader.copy_files_to_device()
+        try:
+            assert set(loaded.key_to_rank_lidx) == selected
+            for name in selected:
+                assert torch.equal(loaded.get_tensor(name), expected[name])
+        finally:
+            loaded.close()
+        assert len(plans) == len(paths)
+        for path, (meta, _) in loader.meta.items():
+            ranges, names = plans[path]
+            assert names == selected & meta.tensors.keys()
+            if selected and "b" in meta.tensors:
+                start, end = (
+                    meta.header_length + offset
+                    for offset in meta.tensors["b"].data_offsets
+                )
+                assert any(lo <= start < end <= hi for lo, hi in ranges)
+        assert len(emulated_spyre.allocated) == len(selected)
+        assert sum(map(len, emulated_spyre.batches)) == len(selected)
+        assert sum(size for _, size in reads) == 256 * len(selected)
+        if not selected:
+            assert not emulated_spyre.host_allocated
+    finally:
+        loader.close()
 
 
 def test_backend_writer_round_trip_into_existing_destination(
@@ -805,6 +874,103 @@ def test_destination_preflight_only_checks_selected_tensors(
     finally:
         loader.close()
     assert not emulated_spyre.moves
+
+
+@pytest.mark.parametrize("mode", ["full", "filtered", "chunked"])
+def test_spyre_finalizes_every_plan_once_before_submission(
+    emulated_spyre, tmp_path, monkeypatch, mode
+):
+    import torch
+
+    from fastsafetensors.copier import host, spyre
+
+    paths, expected = _native_files(
+        tmp_path, moved={"plain": {"test_layout": 1}}, num_shards=1
+    )
+    selected = set(expected) if mode == "full" else {"a", "plain"}
+    loader = SafeTensorsFileLoader(
+        None,
+        "spyre:0",
+        destinations={name: torch.empty_like(expected[name]) for name in selected},
+        set_numa=False,
+    )
+    loader.add_filenames({0: paths})
+    planned = {}
+    set_chunk, submit = spyre.SpyreCopier.set_chunk, spyre.SpyreCopier.submit_io
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("planning must not do IO; submission must reuse the checked plan")
+
+    def record_plan(self, ranges, names, allocation_size=None):
+        assert self.metadata.src not in planned
+        with monkeypatch.context() as patch:
+            patch.setattr(spyre, "pread_into", forbidden)
+            patch.setattr(host, "pread_into", forbidden)
+            patch.setattr(self.ops, "empty_tensor", forbidden)
+            patch.setattr(self.ops, "allocate_host_buffer", forbidden)
+            patch.setattr(self.reader, "submit_read", forbidden)
+            set_chunk(self, ranges, names, allocation_size)
+        planned[self.metadata.src] = list(self.plan[1])
+        assert not emulated_spyre.batches and not emulated_spyre.moves
+        assert not emulated_spyre.allocated and not emulated_spyre.host_allocated
+
+    def record_submit(self, *args):
+        assert planned.keys() == loader.meta.keys()
+        with monkeypatch.context() as patch:
+            patch.setattr(spyre, "native_specs", forbidden)
+            patch.setattr(self.ops, "layout_from_json", forbidden)
+            patch.setattr(self.ops, "validate_destination", forbidden)
+            patch.setattr(self.ops, "validate_plain_destination", forbidden)
+            return submit(self, *args)
+
+    monkeypatch.setattr(spyre.SpyreCopier, "set_chunk", record_plan)
+    monkeypatch.setattr(spyre.SpyreCopier, "submit_io", record_submit)
+    if mode == "filtered":
+        loader.set_tensor_filter(selected.__contains__)
+    elif mode == "chunked":
+        loader._set_chunk_plan(
+            {
+                path: (
+                    selected & meta.tensors.keys(),
+                    meta.select_byte_ranges(selected.__contains__),
+                    None,
+                )
+                for path, (meta, _) in loader.meta.items()
+            }
+        )
+    try:
+        loaded = loader.copy_files_to_device()
+        try:
+            assert set(loaded.key_to_rank_lidx) == selected
+            for name in selected:
+                assert torch.equal(loaded.get_tensor(name), expected[name])
+            for path, (meta, _) in loader.meta.items():
+                assert planned[path] == [n for n in meta.tensors if n in selected]
+        finally:
+            loaded.close()
+    finally:
+        loader.close()
+
+
+def test_spyre_submission_requires_a_successful_plan(emulated_spyre, tmp_path):
+    paths, _ = _native_files(tmp_path, num_shards=1)
+    loader = SafeTensorsFileLoader(None, "spyre:0", set_numa=False)
+    metadata = SafeTensorsMetadata.from_file(paths[0], loader.framework)
+    copier = loader.copier_constructor(metadata, loader.device, loader.framework)
+    try:
+        with pytest.raises(RuntimeError, match="set_chunk must finalize"):
+            copier.submit_io(False, 1024)
+        copier.set_chunk([], set())
+        with pytest.raises(ValueError, match="unknown chunk"):
+            copier.set_chunk([], {"unknown"})
+        with pytest.raises(RuntimeError, match="set_chunk must finalize"):
+            copier.submit_io(False, 1024)
+        assert copier.fd is None and copier.request is None
+        assert not emulated_spyre.batches and not emulated_spyre.allocated
+        assert not emulated_spyre.host_allocated
+    finally:
+        copier.finish_io()
+        loader.close()
 
 
 def test_native_validation_failure_closes_staged_shards(
@@ -1111,6 +1277,11 @@ def test_copier_cleanup_only_cancels_its_own_file(emulated_spyre, tmp_path):
         for path in paths
     ]
     try:
+        for copier in copiers:
+            names = set(copier.metadata.tensors)
+            copier.set_chunk(
+                copier.metadata.select_byte_ranges(names.__contains__), names
+            )
         buffers = [copier.submit_io(False, 1024) for copier in copiers]
         copiers[0].finish_io()
         copiers[0].finish_io()
@@ -1184,12 +1355,9 @@ def test_copier_finish_keeps_fd_open_until_running_pread_drains(
 
     monkeypatch.setattr(host, "pread_into", read)
     loader = SafeTensorsFileLoader(None, "spyre:0", set_numa=False)
-    copier = loader.copier_constructor(
-        SafeTensorsMetadata.from_file(paths[0], loader.framework),
-        loader.device,
-        loader.framework,
-    )
-    copier.select_tensors(lambda name: name == "a")
+    metadata = SafeTensorsMetadata.from_file(paths[0], loader.framework)
+    copier = loader.copier_constructor(metadata, loader.device, loader.framework)
+    copier.set_chunk(metadata.select_byte_ranges(lambda name: name == "a"), {"a"})
     try:
         copier.submit_io(False, 1024)
         fd = copier.fd

@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -171,21 +171,23 @@ class SpyreCopier(CopierInterface):
         self.destinations: dict[str, TensorBase] = {
             name: self.ops.as_tensor(tensor) for name, tensor in destinations.items()
         }
-        self.names: list[str] | None = None
+        self.plan: (
+            tuple[dict[str, NativeTensorSpec], list[str], Device, dict[str, Any]] | None
+        ) = None
         self.out: dict[str, TensorBase] = {}
         self.moved: dict[str, Any] = {}
         self.fd: int | None = None
         self.tp_size, self.tp_rank = tp_size, tp_rank
 
-    def select_tensors(self, keep: Callable[[str], bool]) -> None:
-        self.names = [n for n in self.metadata.tensors if keep(n)]
-
     def set_chunk(self, byte_ranges, names, allocation_size=None) -> None:
-        """Accept ParallelLoader's whole-tensor chunk, never slice native bytes.
+        """Accept the loader's exact tensor selection, never slice native bytes.
 
         File-span allocation padding is unnecessary with individual tensors.
         A supplied allocation_size is validated but does not pad destinations.
+        Finalize metadata, layouts and supplied destinations without allocating,
+        reading payloads or submitting transfers, including for a full-file plan.
         """
+        self.plan = None
         ranges = validated_byte_ranges(self.metadata, byte_ranges)
         if ranges is None:
             raise ValueError("chunk byte_ranges must be explicit")
@@ -204,19 +206,8 @@ class SpyreCopier(CopierInterface):
                     covered = max(covered, hi)
             if covered < end:
                 raise ValueError(f"{name}: chunk must cover the whole tensor")
-        self.select_tensors(names.__contains__)
-
-    @classmethod
-    def chunk_transient_multiplier(cls, paths) -> int:
-        raise NotImplementedError(
-            "Spyre device_memory_budget is unsupported: payload byte sizes do not "
-            "account for logical-storage padding and moved tensor layouts; "
-            "use max_batch_bytes for whole-tensor chunking instead"
-        )
-
-    def _validate_plan(self):
+        names = [n for n in self.metadata.tensors if n in names]
         specs = native_specs(self.metadata, tp_size=self.tp_size, tp_rank=self.tp_rank)
-        names = self.names if self.names is not None else list(self.metadata.tensors)
         device = self.ops.device(self.device.as_str())
         md = self.metadata.metadata
         layouts = {}
@@ -261,19 +252,27 @@ class SpyreCopier(CopierInterface):
                 self.ops.validate_plain_destination(
                     name, dst, frame.shape, frame.dtype, device, layout=moved[name]
                 )
-        return specs, names, device, layouts
+        self.plan = specs, names, device, layouts
 
-    def validate_io(self) -> None:
-        self._validate_plan()
+    @classmethod
+    def chunk_transient_multiplier(cls, paths) -> int:
+        raise NotImplementedError(
+            "Spyre device_memory_budget is unsupported: payload byte sizes do not "
+            "account for logical-storage padding and moved tensor layouts; "
+            "use max_batch_bytes for whole-tensor chunking instead"
+        )
 
     def submit_io(self, use_buf_register: bool, max_copy_block_size: int):
         if max_copy_block_size <= 0:
             raise ValueError("max_copy_block_size must be positive")
-        specs, names, device, self.moved = self._validate_plan()
+        if self.plan is None:
+            raise RuntimeError("set_chunk must finalize the Spyre load plan before IO")
+        specs, names, device, layouts = self.plan
+        self.moved = layouts.copy()
         fd = os.open(self.metadata.src, os.O_RDONLY)
         self.fd = fd
         transfers = []
-        # Everything is validated and allocated here, before any data moves.
+        # New allocations and transfer resources are still checked at submission.
         try:
             for name in names:
                 frame = self.metadata.tensors[name]

@@ -424,6 +424,25 @@ class BaseSafeTensorsFileLoader:
                 factories[rank].append(factory)
                 if copier is not None:
                     chunk = self._chunk_plan.get(realpath)
+                    if chunk is None and (
+                        device_native
+                        or realpath in self._sliced_files
+                        or self._tensor_filter is not None
+                    ):
+                        # Decide exact names here, before coalescing byte ranges:
+                        # nearby skipped tensors may lie inside a merged run.
+                        keep = self._tensor_filter
+                        kept = {n for n in meta.tensors if keep is None or keep(n)}
+                        ranges = meta.select_byte_ranges(kept.__contains__)
+                        if device_native or realpath in self._sliced_files:
+                            # Native copiers need exact allocation names. Sliced
+                            # files need a compact span (issue #127), including
+                            # an empty allocation when no tensor is selected.
+                            chunk = (kept, ranges, None)
+                        else:
+                            # Preserve full-buffer allocation and the permitted
+                            # full-read no-op for ordinary filtered copiers.
+                            copier.set_byte_ranges(ranges)
                     if chunk is not None:
                         # Copiers without partial-read support refuse the chunk
                         # plan here (CopierInterface.set_chunk raises).
@@ -434,34 +453,10 @@ class BaseSafeTensorsFileLoader:
                             copier.set_chunk(ranges, names)
                         else:
                             copier.set_chunk(ranges, names, allocation_size)
-                    elif realpath in self._sliced_files:
-                        # Recorded row ranges narrow this file: load it as a
-                        # compact chunk (buffer spanning only the selected runs)
-                        # instead of the whole data section, so a large fused
-                        # tensor does not need a full-file allocation (issue
-                        # #127). The buffer spans min_start..max_end of the
-                        # kept runs: unselected rows between two sliced
-                        # tensors of the same file are allocated but not read
-                        # (e.g. weight+scale of one Engram layer at TP4 leaves
-                        # ~3/4 of the table's span between them). Partial-
-                        # read copiers only; others refuse
-                        # (CopierInterface.set_chunk raises). An empty range
-                        # set allocates nothing (set_chunk), unlike
-                        # set_byte_ranges which would keep the whole data
-                        # section.
-                        keep = self._tensor_filter
-                        kept = {n for n in meta.tensors if keep is None or keep(n)}
-                        ranges = meta.select_byte_ranges(lambda n: n in kept)
-                        copier.set_chunk(ranges, kept)
-                    elif self._tensor_filter is not None:
-                        copier.select_tensors(self._tensor_filter)
-                    validate_io = getattr(copier, "validate_io", None)
-                    if callable(validate_io):
-                        validate_io()
                 configured.append(factory)
                 lidx += 1
-            # All selected-file preflights must finish before the first worker
-            # can start: a later destination mismatch must not race earlier DMA.
+            # Finalize every selected-file plan before the first worker starts:
+            # a later destination mismatch must not race earlier DMA.
             for factory in configured:
                 factory.submit_io(
                     use_buf_register,

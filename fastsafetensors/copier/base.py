@@ -4,7 +4,6 @@ import operator
 from abc import ABC, abstractmethod
 from typing import (
     TYPE_CHECKING,
-    Callable,
     ClassVar,
     Dict,
     List,
@@ -123,13 +122,6 @@ def validated_chunk_allocation_size(
 class CopierInterface(ABC):
     metadata: SafeTensorsMetadata
 
-    def validate_io(self) -> None:
-        """Preflight the selected tensors before any file starts IO.
-
-        Must not allocate destinations, read payloads or submit transfers.
-        Submission still validates resources created after this preflight.
-        """
-
     def enable_tensor_readiness(self) -> bool:
         """Opt into view creation during IO and tensor-specific DMA waits.
 
@@ -157,15 +149,6 @@ class CopierInterface(ABC):
     # layout): no slicing, dtype conversion or collectives may touch them.
     # Implies owns_tensor_storage.
     device_native: ClassVar[bool] = False
-
-    def select_tensors(self, keep: Callable[[str], bool]) -> None:
-        """Load only the tensors ``keep`` accepts.
-
-        The default reads the byte runs covering them (``set_byte_ranges``),
-        which may include neighbours; copiers that need the exact names (e.g.
-        to allocate one destination per tensor) override this.
-        """
-        self.set_byte_ranges(self.metadata.select_byte_ranges(keep))
 
     def set_byte_ranges(self, byte_ranges: Optional[List[Tuple[int, int]]]) -> None:
         """Restrict reads to these ``[start, end)`` absolute file-offset runs.
