@@ -924,11 +924,11 @@ def test_native_entry_owns_wrapped_sources_until_encode(ops, monkeypatch):
     import gc
     import weakref
 
-    from fastsafetensors.copier import spyre
+    from fastsafetensors.native import native_entry, native_fill
 
     raw = torch.arange(4.0)
     reference = weakref.ref(raw)
-    entry = spyre.native_entry(
+    entry = native_entry(
         "w",
         raw,
         torch.empty_like(raw),
@@ -954,7 +954,7 @@ def test_native_entry_owns_wrapped_sources_until_encode(ops, monkeypatch):
         type(ops), "tensor_layout", lambda self, t: canonical_layout([4], DType.F32)[0]
     )
     monkeypatch.setattr(type(ops), "tensor_nbytes", lambda self, t: 128)
-    spyre.native_fill([(memoryview(bytearray(128)), entry)])
+    native_fill([(memoryview(bytearray(128)), entry)])
     del entry
     gc.collect()
     assert reference() is None

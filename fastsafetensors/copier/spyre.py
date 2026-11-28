@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre-native checkpoint encoding, loading and host-to-device staging.
+"""Spyre-native checkpoint loading and host-to-device staging.
 
 Importing this module registers the copier without importing torch-spyre.
 Spyre operations load the optional dependency when needed. ParallelLoader owns
@@ -25,21 +25,22 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Sequence
-from dataclasses import dataclass
 from typing import Any, Mapping
 
 from ..common import SafeTensorsMetadata
 from ..frameworks import TensorBase, get_framework_op
 from ..native import (
     MAX_TENSOR_BYTES,
-    NativeFormat,
+    NATIVE_FORMAT,
+    PROFILE,
     NativeFormatError,
     NativeTensorSpec,
-    native_metadata,
+    native_entry,
+    native_fill,
+    native_shard_metadata,
     native_specs,
+    split_native_entries,
 )
-from ..saver import WriteEntry, tensor_fill
 from ..st_types import Device, DeviceType, DType
 from .base import (
     CopierInterface,
@@ -50,17 +51,16 @@ from .base import (
 from .host import TRANSFER_LOCK, HostFileReader, HostReadRequest, pread_into
 from .registry import CopierConstructFunc, register_copier_constructor
 
-DEVICE_NAME = "spyre"
 COPIER_TYPE = "spyre"
-FORMAT = "spyre.native.v1"
+FORMAT = PROFILE
 MAX_TRANSFER_BYTES = MAX_TENSOR_BYTES
-NATIVE_FORMAT = NativeFormat(device=DEVICE_NAME, format=FORMAT)
 __all__ = [
     "COPIER_TYPE",
     "FORMAT",
     "NATIVE_FORMAT",
     "SpyreCopier",
     "MAX_TRANSFER_BYTES",
+    # Compatibility exports; the save-side implementation lives in native.py.
     "native_entry",
     "native_fill",
     "native_shard_metadata",
@@ -69,83 +69,6 @@ __all__ = [
 
 # Plain payloads that must be restored to Spyre, with an optional device layout.
 KEY_MOVED = "torch_spyre.moved"
-
-
-def _tensor_ops():
-    return get_framework_op("pytorch").get_native_ops(Device(DeviceType.SPYRE))
-
-
-@dataclass(frozen=True)
-class _NativePayload:
-    src: TensorBase
-    dst: TensorBase
-    spec: NativeTensorSpec
-
-
-def native_entry(
-    name: str,
-    src: Any,
-    dst: Any,
-    *,
-    nbytes: int,
-    layout: Any,
-) -> WriteEntry:
-    """Describe a host tensor encoded for an allocated Spyre destination.
-
-    ``nbytes`` and ``layout`` describe dst's physical storage, as reported by
-    torch-spyre. No conversion or device transfer happens until native_fill.
-    """
-    if nbytes <= 0:
-        raise ValueError(f"{name}: native payload size must be positive")
-    ops = _tensor_ops()
-    src, dst = ops.as_tensor(src), ops.as_tensor(dst)
-    spec = ops.tensor_spec(name, dst, nbytes, layout)
-    return WriteEntry(name, DType.U8, [nbytes], nbytes, _NativePayload(src, dst, spec))
-
-
-def native_shard_metadata(
-    entries: Sequence[WriteEntry], *, tp_size=1, tp_rank=0
-) -> dict[str, str]:
-    """ParallelSaver callback describing this shard's Spyre-native payloads."""
-    native = [e for e in entries if isinstance(e.source, _NativePayload)]
-    if not native:
-        return {}
-    if len(native) != len(entries):
-        raise NativeFormatError("native and portable entries require separate files")
-    return native_metadata(
-        NATIVE_FORMAT,
-        {e.name: e.source.spec for e in native},
-        tp_size=tp_size,
-        tp_rank=tp_rank,
-    )
-
-
-def split_native_entries(entries):
-    """Separate files are required by the all-native profile contract."""
-    return (
-        [e for e in entries if isinstance(e.source, _NativePayload)],
-        [e for e in entries if not isinstance(e.source, _NativePayload)],
-    )
-
-
-def native_fill(work: list[tuple[memoryview, WriteEntry]]) -> None:
-    """ParallelSaver callback encoding native entries and copying plain tensors.
-
-    Conversion writes directly into the saver-owned buffers; allocated Spyre
-    destinations describe the layout but are not filled by this operation.
-    """
-    plain: list[tuple[memoryview, WriteEntry]] = []
-    native: list[tuple[memoryview, WriteEntry]] = []
-    for buf, entry in work:
-        (native if isinstance(entry.source, _NativePayload) else plain).append(
-            (buf, entry)
-        )
-    if plain:
-        tensor_fill()(plain)
-    if native:
-        _tensor_ops().encode_tensors(
-            [(buf, entry.source.src, entry.source.dst) for buf, entry in native]
-        )
 
 
 class SpyreCopier(CopierInterface):
@@ -350,7 +273,9 @@ def load_library_spyre(device: Device, **kwargs) -> None:
         raise ValueError("spyre copier requires the pytorch framework")
     try:
         (
-            framework.get_native_ops(device) if framework is not None else _tensor_ops()
+            framework.get_native_ops(device)
+            if framework is not None
+            else get_framework_op("pytorch").get_native_ops(Device(DeviceType.SPYRE))
         ).load_library()
     except ModuleNotFoundError as e:
         if e.name != "torch_spyre":

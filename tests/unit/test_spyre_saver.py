@@ -16,25 +16,37 @@ from safetensors.torch import load_file, save_file
 
 from fastsafetensors import ParallelSaver
 from fastsafetensors.common import SafeTensorsMetadata
-from fastsafetensors.copier.spyre import (
-    NATIVE_FORMAT,
-    native_entry,
-    native_fill,
-    native_shard_metadata,
-)
 from fastsafetensors.frameworks._torch import TorchOp
 from fastsafetensors.native import (
+    NATIVE_FORMAT,
     NativeFormatError,
     canonical_layout,
     checkpoint_paths,
     convert_to_spyre,
+    native_entry,
+    native_fill,
     native_format,
+    native_shard_metadata,
     native_specs,
 )
 from fastsafetensors.saver import plain_entry
 from fastsafetensors.st_types import Device, DType
 
 torch = pytest.importorskip("torch")
+
+
+def test_legacy_copier_exports_native_save_helpers():
+    from fastsafetensors import native
+    from fastsafetensors.copier import spyre
+
+    for name in (
+        "NATIVE_FORMAT",
+        "native_entry",
+        "native_fill",
+        "native_shard_metadata",
+        "split_native_entries",
+    ):
+        assert getattr(spyre, name) is getattr(native, name)
 
 
 @pytest.fixture(autouse=True)

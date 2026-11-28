@@ -93,12 +93,12 @@ def test_i64_stays_portable(tmp_path):
     from safetensors import safe_open
 
     from fastsafetensors.common import SafeTensorsMetadata
-    from fastsafetensors.copier.spyre import (
+    from fastsafetensors.native import (
         native_fill,
+        native_format,
         native_shard_metadata,
         split_native_entries,
     )
-    from fastsafetensors.native import native_format
     from fastsafetensors.saver import ParallelSaver, plain_entry
 
     with pytest.raises(ValueError):

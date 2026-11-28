@@ -348,6 +348,11 @@ bounded by `workspace_bytes` (default 8 MiB, minimum 512 bytes; both may coexist
 including wide rows. Conversion performs no DMA. Output mappings/page cache are
 **not an RSS limit** and are separate from this workspace and loader slots.
 
+The `ParallelSaver` helpers for encoding with an already allocated Spyre
+destination (`native_entry`, `native_fill`, `native_shard_metadata`, and
+`split_native_entries`) are available from `fastsafetensors.native`. They are
+separate from the bounded standalone converter, which allocates no device tensor.
+
 The `load` command uses `ParallelLoader` and releases weights after each delivery
 chunk, so models larger than one card can be checked. `--batch-mib` must fit the
 largest whole tensor. `--verify-source` checks every logical value against an

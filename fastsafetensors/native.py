@@ -9,13 +9,16 @@ never objects supplied by the artifact.
 
 import json
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from math import prod
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
 from .common import SafeTensorsMetadata
-from .st_types import DType
+from .frameworks import TensorBase
+from .saver import WriteEntry, tensor_fill
+from .st_types import Device, DeviceType, DType
 
 NATIVE_VERSION = 1
 
@@ -38,6 +41,9 @@ class NativeFormat:
     device: str
     format: str
     version: int = NATIVE_VERSION
+
+
+NATIVE_FORMAT = NativeFormat(device="spyre", format=PROFILE)
 
 
 @dataclass(frozen=True)
@@ -155,7 +161,7 @@ def native_metadata(
     fmt: NativeFormat, specs: Mapping[str, NativeTensorSpec], *, tp_size=1, tp_rank=0
 ) -> Dict[str, str]:
     """Encode only necessary logical facts; reject arbitrary runtime layouts."""
-    if fmt != NativeFormat("spyre", PROFILE):
+    if fmt != NATIVE_FORMAT:
         raise NativeFormatError("unsupported native profile")
     _target({"tp_size": tp_size, "tp_rank": tp_rank})
     if len(specs) > MAX_TENSORS:
@@ -205,7 +211,7 @@ def native_format(meta: SafeTensorsMetadata) -> Optional[NativeFormat]:
         raise NativeFormatError("unknown Spyre metadata key")
     if "torch_spyre.moved" in md:
         raise NativeFormatError("native and portable tensors must be in separate files")
-    return NativeFormat("spyre", PROFILE)
+    return NATIVE_FORMAT
 
 
 def native_specs(
@@ -279,6 +285,85 @@ def native_specs(
         except (KeyError, TypeError, ValueError) as e:
             raise NativeFormatError(f"{meta.src}: bad spec for {name}: {e}")
     return specs
+
+
+@dataclass(frozen=True)
+class _NativePayload:
+    src: TensorBase
+    dst: TensorBase
+    spec: NativeTensorSpec
+
+
+def _tensor_ops():
+    from .frameworks import get_framework_op
+
+    return get_framework_op("pytorch").get_native_ops(Device(DeviceType.SPYRE))
+
+
+def native_entry(
+    name: str,
+    src: Any,
+    dst: Any,
+    *,
+    nbytes: int,
+    layout: Any,
+) -> WriteEntry:
+    """Describe a host tensor encoded for an allocated Spyre destination.
+
+    ``nbytes`` and ``layout`` describe dst's physical storage, as reported by
+    torch-spyre. No conversion or device transfer happens until native_fill.
+    """
+    if nbytes <= 0:
+        raise ValueError(f"{name}: native payload size must be positive")
+    ops = _tensor_ops()
+    src, dst = ops.as_tensor(src), ops.as_tensor(dst)
+    spec = ops.tensor_spec(name, dst, nbytes, layout)
+    return WriteEntry(name, DType.U8, [nbytes], nbytes, _NativePayload(src, dst, spec))
+
+
+def native_shard_metadata(
+    entries: Sequence[WriteEntry], *, tp_size=1, tp_rank=0
+) -> dict[str, str]:
+    """ParallelSaver callback describing this shard's Spyre-native payloads."""
+    native = [e for e in entries if isinstance(e.source, _NativePayload)]
+    if not native:
+        return {}
+    if len(native) != len(entries):
+        raise NativeFormatError("native and portable entries require separate files")
+    return native_metadata(
+        NATIVE_FORMAT,
+        {e.name: e.source.spec for e in native},
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+    )
+
+
+def split_native_entries(entries):
+    """Separate files are required by the all-native profile contract."""
+    return (
+        [e for e in entries if isinstance(e.source, _NativePayload)],
+        [e for e in entries if not isinstance(e.source, _NativePayload)],
+    )
+
+
+def native_fill(work: list[tuple[memoryview, WriteEntry]]) -> None:
+    """ParallelSaver callback encoding native entries and copying plain tensors.
+
+    Conversion writes directly into the saver-owned buffers; allocated Spyre
+    destinations describe the layout but are not filled by this operation.
+    """
+    plain: list[tuple[memoryview, WriteEntry]] = []
+    native: list[tuple[memoryview, WriteEntry]] = []
+    for buf, entry in work:
+        (native if isinstance(entry.source, _NativePayload) else plain).append(
+            (buf, entry)
+        )
+    if plain:
+        tensor_fill()(plain)
+    if native:
+        _tensor_ops().encode_tensors(
+            [(buf, entry.source.src, entry.source.dst) for buf, entry in native]
+        )
 
 
 def checkpoint_paths(source: str) -> List[str]:
@@ -372,8 +457,7 @@ def convert_to_spyre(
     """
     from .copier.host import pread_into
     from .frameworks import get_framework_op
-    from .saver import WriteEntry, plan_shards, shard_paths, write_shards
-    from .st_types import Device, DeviceType
+    from .saver import plan_shards, shard_paths, write_shards
 
     dtype = DType(dtype)
     if dtype not in {DType.F16, DType.F32, DType.BF16}:
@@ -415,9 +499,7 @@ def convert_to_spyre(
             )
 
     def metadata(shard):
-        return native_metadata(
-            NativeFormat("spyre", PROFILE), {e.name: e.source[3] for e in shard}
-        )
+        return native_metadata(NATIVE_FORMAT, {e.name: e.source[3] for e in shard})
 
     paths = shard_paths(base, num_shards)
     if any(os.path.exists(path) for path in paths):

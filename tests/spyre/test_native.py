@@ -43,7 +43,13 @@ from fastsafetensors.common import SafeTensorsMetadata
 from fastsafetensors.copier import spyre as transfer
 from fastsafetensors.frameworks import get_framework_op
 from fastsafetensors.frameworks._torch_spyre import layout_to_json
-from fastsafetensors.native import NativeFormatError
+from fastsafetensors.native import (
+    NativeFormatError,
+    native_entry,
+    native_fill,
+    native_shard_metadata,
+    split_native_entries,
+)
 from fastsafetensors.saver import plain_entry
 from fastsafetensors.st_types import Device
 
@@ -125,7 +131,7 @@ def _write_checkpoint(tensors, base, *, layouts=None, num_shards=2, plain=False)
             )
             try:
                 nbytes = dma_bytes(dst)
-                entry = transfer.native_entry(
+                entry = native_entry(
                     name,
                     t,
                     dst,
@@ -139,14 +145,14 @@ def _write_checkpoint(tensors, base, *, layouts=None, num_shards=2, plain=False)
                 moved[name] = None if layout is None else layout_to_json(layout)
             entries.append(entry)
 
-    native, portable = transfer.split_native_entries(entries)
+    native, portable = split_native_entries(entries)
     saver = ParallelSaver(
         num_shards=num_shards,
-        fill=transfer.native_fill,
-        shard_metadata=transfer.native_shard_metadata,
+        fill=native_fill,
+        shard_metadata=native_shard_metadata,
     )
     paths = saver.save_entries(native, base)
-    return paths + ParallelSaver(num_shards=1, fill=transfer.native_fill).save_entries(
+    return paths + ParallelSaver(num_shards=1, fill=native_fill).save_entries(
         portable,
         base + "-portable",
         metadata={"torch_spyre.moved": json.dumps(moved)},

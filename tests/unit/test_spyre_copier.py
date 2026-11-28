@@ -466,8 +466,8 @@ def emulated_spyre(monkeypatch, framework):
 def _native_files(tmp_path, *, fmt=None, moved=None, num_shards=2, extra_native=False):
     import torch
 
-    from fastsafetensors.copier.spyre import NATIVE_FORMAT
     from fastsafetensors.native import (
+        NATIVE_FORMAT,
         PROFILE,
         NativeTensorSpec,
         canonical_layout,
@@ -645,7 +645,7 @@ def test_backend_writer_round_trip_into_existing_destination(
 ):
     import torch
 
-    from fastsafetensors.copier.spyre import (
+    from fastsafetensors.native import (
         native_entry,
         native_fill,
         native_shard_metadata,
