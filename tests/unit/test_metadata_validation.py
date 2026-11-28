@@ -21,21 +21,6 @@ def _checkpoint(tmp_path, tensors, payload_size):
 
 
 @pytest.mark.parametrize("source", ["file", "buffer"])
-@pytest.mark.parametrize("shape", [[-2, -2], [-1, 0], [True], [1.0], "1"])
-def test_invalid_shapes_are_rejected(tmp_path, framework, monkeypatch, source, shape):
-    path, content = _checkpoint(
-        tmp_path, {"w": {"dtype": "F32", "shape": shape, "data_offsets": [0, 16]}}, 16
-    )
-    with pytest.raises(ValueError, match="nonnegative integers"):
-        if source == "file":
-            SafeTensorsMetadata.from_file(str(path), framework)
-        else:
-            monkeypatch.setattr(
-                cpp, "read_buffer", lambda ptr, n: content[ptr : ptr + n]
-            )
-            SafeTensorsMetadata.from_buffer(0, len(content), str(path), framework)
-
-
 @pytest.mark.parametrize(
     "offsets,shape,payload_size,error",
     [
@@ -46,15 +31,21 @@ def test_invalid_shapes_are_rejected(tmp_path, framework, monkeypatch, source, s
     ],
 )
 def test_invalid_offsets_and_tensor_sizes(
-    tmp_path, framework, offsets, shape, payload_size, error
+    tmp_path, framework, monkeypatch, source, offsets, shape, payload_size, error
 ):
-    path, _ = _checkpoint(
+    path, content = _checkpoint(
         tmp_path,
         {"w": {"dtype": "F32", "shape": shape, "data_offsets": offsets}},
         payload_size,
     )
     with pytest.raises(Exception, match=error):
-        SafeTensorsMetadata.from_file(str(path), framework)
+        if source == "file":
+            SafeTensorsMetadata.from_file(str(path), framework)
+        else:
+            monkeypatch.setattr(
+                cpp, "read_buffer", lambda ptr, n: content[ptr : ptr + n]
+            )
+            SafeTensorsMetadata.from_buffer(0, len(content), str(path), framework)
 
 
 def test_overlapping_tensor_offsets(tmp_path, framework):

@@ -155,6 +155,9 @@ def test_unqualified_i64_rejected_before_runtime(shape):
         '{"tensors":{},"module":"evil"}',
         '{"tensors":{"w":{"logical_shape":[128,150],"logical_shape":[1]}}}',
         '{"tensors":{"w":{"logical_shape":[NaN]}}}',
+        '{"tensors":{"w":{"logical_shape":[Infinity]}}}',
+        '{"tensors":{"w":{"logical_shape":[1e999]}}}',
+        '{"tensors":{"w":{"logical_shape":[-1e999]}}}',
         '{"target":{"tp_size":true,"tp_rank":0},"tensors":{}}',
         '{"target":{"tp_size":1,"tp_rank":1},"tensors":{}}',
         '{"target":{"tp_size":1},"tensors":{}}',
@@ -182,21 +185,26 @@ def test_profile_ownership_size_and_tp():
     native_specs(metadata(), tp_size=1, tp_rank=0)
 
 
-@pytest.mark.parametrize(
-    "text",
-    [
-        '{"w":{},"w":{}}',
-        '{"x":Infinity}',
-        '{"x":1e999}',
-        '{"x":-1e999}',
-        '{"x":{"y":0,"y":1}}',
-    ],
-)
-def test_outer_json_strict(text):
-    with pytest.raises(ValueError):
-        SafeTensorsMetadata(
-            text, len(text) + 8, len(text) + 8, get_framework_op("pytorch")
-        )
+def test_native_json_uses_last_duplicate_value():
+    raw = '{"tensors":{"w":{"logical_shape":[1],"logical_shape":[128,150]}}}'
+    spec = native_specs(metadata(raw=raw))["w"]
+    assert spec.shape == [128, 150] and spec.nbytes == 49152
+
+
+@pytest.mark.parametrize("name", ["w", "w" * 4097])
+@pytest.mark.parametrize("replaced_shape", ["[NaN]", "[" * 33 + "0" + "]" * 33])
+def test_header_json_uses_standard_decoding(name, replaced_shape):
+    entry = (
+        '{"dtype":"F32","shape":'
+        + replaced_shape
+        + ',"shape":[1],"data_offsets":[0,4]}'
+    )
+    text = "{" + json.dumps(name) + ":" + entry + "}"
+    meta = SafeTensorsMetadata(
+        text, len(text) + 8, len(text) + 12, get_framework_op("pytorch")
+    )
+    assert list(meta.tensors) == [name]
+    assert meta.tensors[name].shape == [1]
 
 
 def test_legacy_reader_extracts_carrier(tmp_path):

@@ -3,7 +3,6 @@
 import copy
 import json
 import logging
-import math
 import os
 import re
 import sys
@@ -18,63 +17,6 @@ from .st_types import Device, DType
 
 if TYPE_CHECKING:
     from .allocation import SharedDeviceAllocation
-
-
-MAX_HEADER_BYTES = 100_000_000
-MAX_METADATA_BYTES = 16 << 20
-MAX_JSON_DEPTH = 32
-MAX_KEY_BYTES = 4096
-
-
-def strict_json_loads(text, *, max_bytes=MAX_METADATA_BYTES):
-    """Decode bounded checkpoint JSON, rejecting duplicate keys and non-finite values."""
-    if not isinstance(text, str) or len(text) > max_bytes:
-        raise ValueError("JSON exceeds byte limit or is not a string")
-    if len(text.encode("utf-8")) > max_bytes:
-        raise ValueError("JSON exceeds byte limit")
-    depth, quoted, escaped = 0, False, False
-    for char in text:
-        if quoted:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                quoted = False
-        elif char == '"':
-            quoted = True
-        elif char in "[{":
-            depth += 1
-            if depth > MAX_JSON_DEPTH:
-                raise ValueError("JSON exceeds nesting limit")
-        elif char in "]}":
-            depth -= 1
-
-    def pairs(items):
-        result = OrderedDict()
-        for key, value in items:
-            if len(key.encode("utf-8")) > MAX_KEY_BYTES:
-                raise ValueError("JSON key exceeds byte limit")
-            if key in result:
-                raise ValueError(f"duplicate JSON key: {key!r}")
-            result[key] = value
-        return result
-
-    def invalid_constant(value):
-        raise ValueError(f"non-finite JSON number: {value}")
-
-    def finite_float(value):
-        result = float(value)
-        if not math.isfinite(result):
-            invalid_constant(value)
-        return result
-
-    return json.loads(
-        text,
-        object_pairs_hook=pairs,
-        parse_constant=invalid_constant,
-        parse_float=finite_float,
-    )
 
 
 def init_logger(name: str):
@@ -409,39 +351,10 @@ class SafeTensorsMetadata:
     ):
         self.src = src
         self.framework = framework
-        ser = strict_json_loads(string, max_bytes=MAX_HEADER_BYTES)
-        if not isinstance(ser, dict):
-            raise ValueError("safetensors header must be an object")
+        ser = json.loads(string, object_pairs_hook=OrderedDict)
         self.metadata = ser.get("__metadata__", "")
-        if "__metadata__" in ser and (
-            not isinstance(self.metadata, dict)
-            or any(not isinstance(v, str) for v in self.metadata.values())
-        ):
-            raise ValueError("safetensors metadata values must be strings")
         if "__metadata__" in ser:
             del ser["__metadata__"]
-        if len(ser) > 100_000:
-            raise ValueError("tensor count exceeds limit")
-        for k, buffer in ser.items():
-            if (
-                not isinstance(buffer, dict)
-                or set(buffer) != {"dtype", "shape", "data_offsets"}
-                or not isinstance(buffer["shape"], list)
-                or len(buffer["shape"]) > 64
-                or any(
-                    type(n) is not int or not 0 <= n < (1 << 63)
-                    for n in buffer["shape"]
-                )
-                or not isinstance(buffer["data_offsets"], list)
-                or len(buffer["data_offsets"]) != 2
-                or any(
-                    type(n) is not int or not 0 <= n < (1 << 63)
-                    for n in buffer["data_offsets"]
-                )
-            ):
-                raise ValueError(
-                    f"invalid tensor table entry: {k}; shape must contain nonnegative integers and data_offsets must be valid (InvalidOffset)"
-                )
         self.tensors: Dict[str, TensorFrame] = {}
         self.header_length = header_length
         self.aligned = header_length % framework.get_device_ptr_align() == 0

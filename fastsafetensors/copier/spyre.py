@@ -29,7 +29,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from ..common import SafeTensorsMetadata, strict_json_loads
+from ..common import SafeTensorsMetadata
 from ..frameworks import TensorBase, get_framework_op
 from ..native import (
     MAX_TENSOR_BYTES,
@@ -212,11 +212,7 @@ class SpyreCopier(CopierInterface):
         md = self.metadata.metadata
         layouts = {}
         try:
-            moved = (
-                strict_json_loads(md.get(KEY_MOVED, "{}"))
-                if isinstance(md, dict)
-                else {}
-            )
+            moved = json.loads(md.get(KEY_MOVED, "{}")) if isinstance(md, dict) else {}
             if not isinstance(moved, dict):
                 raise ValueError("expected a name-to-layout object")
             for name in names:

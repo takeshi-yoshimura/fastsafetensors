@@ -1166,6 +1166,24 @@ def test_malformed_moved_json_is_rejected(emulated_spyre, tmp_path):
     assert not emulated_spyre.batches and not emulated_spyre.moves
 
 
+def test_moved_json_uses_last_duplicate_value(emulated_spyre, tmp_path):
+    import torch
+
+    from fastsafetensors.saver import plain_entry, save_sharded
+
+    expected = torch.arange(3, dtype=torch.float32)
+    paths = save_sharded(
+        [plain_entry("plain", expected)],
+        str(tmp_path / "moved"),
+        num_shards=1,
+        metadata={"torch_spyre.moved": '{"plain":3,"plain":null}'},
+    )
+    with fastsafe_open(paths, device="spyre:0") as loaded:
+        assert torch.equal(loaded.get_tensor("plain"), expected)
+        assert loaded.get_tensor_wrapped("plain").device.type == DeviceType.SPYRE
+    assert len(emulated_spyre.moves) == 1 and not emulated_spyre.batches
+
+
 @pytest.mark.parametrize("queue_size", [-1, 0, 2])
 @pytest.mark.parametrize("destinations", [False, True])
 @pytest.mark.parametrize("filtered", [False, True])

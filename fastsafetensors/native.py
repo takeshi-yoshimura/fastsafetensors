@@ -14,7 +14,7 @@ from math import prod
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
-from .common import SafeTensorsMetadata, strict_json_loads
+from .common import SafeTensorsMetadata
 from .st_types import DType
 
 NATIVE_VERSION = 1
@@ -181,7 +181,6 @@ def native_metadata(
     if (tp_size, tp_rank) != (1, 0):
         raw["target"] = {"tp_size": tp_size, "tp_rank": tp_rank}
     encoded = json.dumps(raw, separators=(",", ":"))
-    strict_json_loads(encoded)
     return {KEY_PROFILE: PROFILE, KEY_TENSORS: encoded}
 
 
@@ -216,7 +215,7 @@ def native_specs(
     if native_format(meta) is None:
         return {}
     try:
-        raw = strict_json_loads(_metadata_dict(meta)[KEY_TENSORS])
+        raw = json.loads(_metadata_dict(meta)[KEY_TENSORS])
         if not isinstance(raw, dict) or not {"tensors"} <= raw.keys() <= {
             "target",
             "tensors",

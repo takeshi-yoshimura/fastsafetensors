@@ -252,11 +252,13 @@ omission means TP1/rank0. These fields never request slicing. Pass matching
 `tp_size`/`tp_rank` to the loader. Model-level identity policy belongs to the caller.
 
 Limits are 16 logical axes, extents 1..2^31-1, 4 GiB per native tensor, 100,000
-tensors per shard and 1 TiB aggregate native bytes per load plan. Strict JSON
-decoding rejects duplicate keys, non-finite numbers, over 32 nesting levels,
-keys over 4096 UTF-8 bytes, native metadata over 16 MiB and headers over
-100,000,000 bytes. Schema, carriers, target and aggregate budget are checked
-across the load plan before device allocation or DMA.
+tensors per shard and 1 TiB aggregate native bytes per load plan. JSON is decoded
+with Python's standard `json` module, including its last-value-wins handling of
+duplicate keys; there are no additional JSON depth, key-length or nested-metadata
+size limits. File/buffer readers retain the 100,000,000-byte header limit and the
+existing offset, tensor-size and buffer-bound checks. Native schema, carriers,
+target and aggregate budget are checked across the load plan before device
+allocation or DMA.
 
 ### Fixed geometry
 
