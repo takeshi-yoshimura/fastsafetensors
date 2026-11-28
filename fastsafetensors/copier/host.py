@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import threading
 from collections import deque
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 
@@ -22,7 +22,7 @@ _HOST_BYTES = 16 << 20
 _READ_BLOCK_BYTES = 256 << 20
 
 # Also used by ordinary-copy/conversion fallbacks. Never hold this while waiting
-# for a reader request: the copy worker needs it to make progress.
+# for a reader request: the reader worker needs it to make progress.
 TRANSFER_LOCK = threading.RLock()
 _failed_transfers: list[object] = []
 _transfer_poisoned = False
@@ -58,52 +58,6 @@ def _read_block(fd: int, view: memoryview, offset: int) -> None:
         pread_into(fd, view, offset)
 
 
-class HostBufferPool:
-    """Exactly two fixed-capacity slots, shared by all files in one loader."""
-
-    def __init__(self, ops: HostTransferOp, max_bytes: int) -> None:
-        alignment = ops.transfer_alignment()
-        if alignment <= 0:
-            raise ValueError("transfer alignment must be positive")
-        self.slot_bytes = max_bytes // (2 * alignment) * alignment
-        if self.slot_bytes <= 0:
-            raise ValueError(
-                f"host capacity must fit two {alignment}-byte aligned slots"
-            )
-        self.ops = ops
-        self.max_bytes = max_bytes
-        self.buffers: list[TensorBase] = []
-        self.busy: set[int] = set()
-        self.condition = threading.Condition()
-        self.peak_bytes = 0
-
-    def wake(self) -> None:
-        with self.condition:
-            self.condition.notify_all()
-
-    def acquire(self, cancelled: Callable[[], bool]) -> TensorBase | None:
-        with self.condition:
-            while True:
-                if cancelled():
-                    return None
-                check_transfer_state()
-                if not self.buffers:
-                    self.buffers = [
-                        self.ops.allocate_host_buffer(self.slot_bytes) for _ in range(2)
-                    ]
-                    self.peak_bytes = 2 * self.slot_bytes
-                for buffer in self.buffers:
-                    if id(buffer) not in self.busy:
-                        self.busy.add(id(buffer))
-                        return buffer
-                self.condition.wait()
-
-    def release(self, buffer: TensorBase) -> None:
-        with self.condition:
-            self.busy.remove(id(buffer))
-            self.condition.notify_all()
-
-
 Copy = Callable[[list[tuple[TensorBase, TensorBase, int, int]]], HostTransfer | None]
 FileEntry = tuple[tuple[int, int], TensorBase]
 
@@ -117,18 +71,20 @@ class HostReadRequest:
     cancelled: threading.Event = field(default_factory=threading.Event)
     done: threading.Event = field(default_factory=threading.Event)
     error: BaseException | None = None
-    producing: bool = True
-    inflight: int = 0
 
 
-@dataclass
+@dataclass(eq=False)
 class _Group:
     request: HostReadRequest
     index: int
     offset: int
     size: int
     buffer: TensorBase
+    reads: deque[Future] = field(default_factory=deque)
     ticket: HostTransfer | None = None
+
+
+_ReadBlocks = Generator[tuple[int, memoryview, int], None, None]
 
 
 def host_ranges(sizes: list[int], slot_bytes: int) -> Iterator[tuple[int, int, int]]:
@@ -139,119 +95,72 @@ def host_ranges(sizes: list[int], slot_bytes: int) -> Iterator[tuple[int, int, i
 
 
 class _ReaderState:
-    """Workers own state, not HostFileReader, so dropping the owner can join them."""
+    """The worker owns slot transitions; pread workers only fill their views."""
 
     def __init__(self, ops: HostTransferOp, max_threads: int, max_bytes: int) -> None:
         self.ops = ops
         self.max_threads = max_threads
-        self.pool = HostBufferPool(ops, max_bytes)
+        alignment = ops.transfer_alignment()
+        if alignment <= 0:
+            raise ValueError("transfer alignment must be positive")
+        self.slot_bytes = max_bytes // (2 * alignment) * alignment
+        if self.slot_bytes <= 0:
+            raise ValueError(
+                f"host capacity must fit two {alignment}-byte aligned slots"
+            )
+        self.buffers: list[TensorBase] = []
         self.condition = threading.Condition()
         self.pending: deque[HostReadRequest] = deque()
-        self.ready: deque[_Group] = deque()
         self.requests: set[HostReadRequest] = set()
         self.closed = False
-        self.producer_done = False
-        self.threads: list[threading.Thread] = []
+        self.thread: threading.Thread | None = None
 
     def complete(self, request: HostReadRequest) -> None:
-        # Called under condition, only after reads AND copies have drained.
-        if not request.producing and request.inflight == 0:
+        # Called only after all of this request's slots have retired.
+        with self.condition:
             request.entries.clear()
             self.requests.discard(request)
             request.done.set()
 
     def fail(self, request: HostReadRequest, error: BaseException) -> None:
-        with self.condition:
-            if request.error is None:
-                request.error = error.with_traceback(None)
-            request.cancelled.set()
-        self.pool.wake()
+        if request.error is None:
+            request.error = error.with_traceback(None)
+        request.cancelled.set()
 
-    def read_group(self, group: _Group, executor: ThreadPoolExecutor) -> None:
+    def read_blocks(self, group: _Group) -> _ReadBlocks:
         request = group.request
+        (fd, begin), _ = request.entries[group.index]
+        with self.ops.host_buffer_view(group.buffer[: group.size]) as view:
+            for offset in range(0, group.size, request.block_size):
+                yield fd, view[
+                    offset : offset + request.block_size
+                ], begin + group.offset + offset
 
-        def blocks():
-            (fd, begin), _ = request.entries[group.index]
-            with self.ops.host_buffer_view(group.buffer[: group.size]) as view:
-                size = group.size
-                for offset in range(0, size, request.block_size):
-                    yield fd, view[
-                        offset : offset + request.block_size
-                    ], begin + group.offset + offset
-
-        futures: deque[Future] = deque()
-        try:
-            for block in blocks():
-                if request.cancelled.is_set():
+    def fill_reads(
+        self, group: _Group, blocks: _ReadBlocks, executor: ThreadPoolExecutor
+    ) -> None:
+        while (
+            len(group.reads) < self.max_threads and not group.request.cancelled.is_set()
+        ):
+            try:
+                block = next(blocks, None)
+                if block is None:
                     break
-                # Bound outstanding futures even for tiny read block settings.
-                if len(futures) >= self.max_threads:
-                    futures.popleft().result()
-                futures.append(executor.submit(_read_block, *block))
-            while futures:
-                futures.popleft().result()
-        finally:
-            # A submit/read failure or cancellation cannot let fd/views escape
-            # before all started syscalls finish. Do not mask the first error.
-            # Do not merely cancel futures: a cancelled executor work item may
-            # still retain its host view until a worker dequeues it.
-            for future in futures:
-                try:
-                    future.result()
-                except BaseException:
-                    pass
+                group.reads.append(executor.submit(_read_block, *block))
+            except BaseException as error:
+                self.fail(group.request, error)
 
-    def produce(self) -> None:
-        try:
-            with ThreadPoolExecutor(
-                max_workers=self.max_threads, thread_name_prefix="fst-pread"
-            ) as executor:
-                while True:
-                    with self.condition:
-                        self.condition.wait_for(lambda: self.pending or self.closed)
-                        if not self.pending:
-                            return
-                        request = self.pending.popleft()
-                    try:
-                        for index, offset, size in host_ranges(
-                            request.sizes, self.pool.slot_bytes
-                        ):
-                            buffer = self.pool.acquire(request.cancelled.is_set)
-                            if buffer is None:
-                                break
-                            group = _Group(request, index, offset, size, buffer)
-                            del buffer
-                            try:
-                                self.read_group(group, executor)
-                            except BaseException:
-                                self.pool.release(group.buffer)
-                                del group
-                                raise
-                            with self.condition:
-                                request.inflight += 1
-                                self.ready.append(group)
-                                self.condition.notify_all()
-                            del group
-                    except BaseException as error:
-                        self.fail(request, error)
-                    finally:
-                        with self.condition:
-                            request.producing = False
-                            self.complete(request)
-                            self.condition.notify_all()
-        except BaseException as error:
-            # Executor construction/teardown failures must not strand waiters.
-            with self.condition:
-                self.closed = True
-                for request in list(self.requests):
-                    self.fail(request, error)
-                    request.producing = False
-                    self.complete(request)
-                self.pending.clear()
-        finally:
-            with self.condition:
-                self.producer_done = True
-                self.condition.notify_all()
+    def drain_reads(
+        self, group: _Group, blocks: _ReadBlocks, executor: ThreadPoolExecutor
+    ) -> None:
+        # Do not cancel futures: queued work still owns its view and fd.
+        while group.reads:
+            try:
+                group.reads.popleft().result()
+            except BaseException as error:
+                self.fail(group.request, error)
+            self.fill_reads(group, blocks, executor)
+        blocks.close()
 
     def transfer(self, group: _Group) -> None:
         request = group.request
@@ -259,7 +168,11 @@ class _ReaderState:
             if group.ticket is None:
                 if request.cancelled.is_set():
                     return
-                check_transfer_state()
+                try:
+                    check_transfer_state()
+                except RuntimeError as error:
+                    self.fail(request, error)
+                    return
             destination = request.entries[group.index][1]
             try:
                 if group.ticket is None:
@@ -275,6 +188,7 @@ class _ReaderState:
                     )
                 else:
                     # Already-started work must be drained even after cancel.
+                    check_transfer_state()
                     group.ticket.wait()
                     group.ticket = None
             except BaseException as error:
@@ -283,41 +197,101 @@ class _ReaderState:
                 ):
                     _failed_transfers.append((group.buffer, destination, group.ticket))
                     poison_transfer_state()
-                raise
-
-    def consume(self) -> None:
-        pending: deque[_Group] = deque()
-        while True:
-            with self.condition:
-                # Fill both slots before waiting. A single/tail transfer must
-                # progress without another submit_read, wait_read or close call.
-                self.condition.wait_for(
-                    lambda: self.ready
-                    or self.producer_done
-                    or len(pending) == 2
-                    or (pending and not any(r.producing for r in self.requests))
-                )
-                if pending and (len(pending) == 2 or not self.ready):
-                    group = pending.popleft()
-                elif self.ready:
-                    group = self.ready.popleft()
-                else:
-                    return
-            request = group.request
-            try:
-                self.transfer(group)
-            except BaseException as error:
                 self.fail(request, error)
-            else:
+
+    def pipeline(self, executor: ThreadPoolExecutor, slots: list[_Group]) -> None:
+        # FIFO request cursor plus at most two occupied slots. Only this thread
+        # changes slot state; no worker waits for another worker to free a slot.
+        request: HostReadRequest | None = None
+        ranges: Iterator[tuple[int, int, int]] = iter(())
+
+        def complete_if_finished(owner: HostReadRequest) -> None:
+            if request is not owner and not any(g.request is owner for g in slots):
+                self.complete(owner)
+
+        def start_read() -> tuple[_Group, _ReadBlocks] | None:
+            nonlocal request, ranges
+            if len(slots) == 2:
+                return None
+            while True:
+                if request is None:
+                    with self.condition:
+                        if not self.pending:
+                            return None
+                        request = self.pending.popleft()
+                    ranges = host_ranges(request.sizes, self.slot_bytes)
+                try:
+                    if not request.cancelled.is_set():
+                        check_transfer_state()
+                        region = next(ranges, None)
+                        if region is not None:
+                            if not self.buffers:
+                                self.buffers = [
+                                    self.ops.allocate_host_buffer(self.slot_bytes)
+                                    for _ in range(2)
+                                ]
+                            break
+                except BaseException as error:
+                    self.fail(request, error)
+                owner, request = request, None
+                complete_if_finished(owner)
+            buffer = next(
+                b for b in self.buffers if all(g.buffer is not b for g in slots)
+            )
+            group = _Group(request, *region, buffer)
+            slots.append(group)
+            blocks = self.read_blocks(group)
+            self.fill_reads(group, blocks, executor)
+            return group, blocks
+
+        reading = None
+        while True:
+            if reading is None:
+                reading = start_read()
+            if reading is not None:
+                group, blocks = reading
+                self.drain_reads(group, blocks, executor)
+                # Start lookahead before enqueue, even for a synchronous adapter.
+                reading = start_read()
+                self.transfer(group)
                 if group.ticket is not None:
-                    pending.append(group)
                     continue
-            # Failed transfers are quarantined; poison prevents slot reuse.
-            self.pool.release(group.buffer)
+            elif slots:
+                group = slots[0]
+                self.transfer(group)
+            else:
+                with self.condition:
+                    self.condition.wait_for(lambda: self.pending or self.closed)
+                    if not self.pending:
+                        return
+                continue
+            # A failed wait leaves the owners quarantined; poison bars reuse.
+            slots.remove(group)
+            complete_if_finished(group.request)
+            del group
+
+    def run(self) -> None:
+        slots: list[_Group] = []
+        try:
+            with ThreadPoolExecutor(
+                max_workers=self.max_threads, thread_name_prefix="fst-pread"
+            ) as executor:
+                self.pipeline(executor, slots)
+        except BaseException as error:
+            # Executor exit has drained reads. If the scheduler itself failed,
+            # any ticket still in a slot must retain its owners until restart.
+            with TRANSFER_LOCK:
+                for group in slots:
+                    if group.ticket is not None:
+                        dst = group.request.entries[group.index][1]
+                        _failed_transfers.append((group.buffer, dst, group.ticket))
+                        poison_transfer_state()
             with self.condition:
-                request.inflight -= 1
-                self.complete(request)
-            del group, request
+                self.closed = True
+                for request in list(self.requests):
+                    self.fail(request, error)
+                    self.complete(request)
+                self.pending.clear()
 
 
 class HostFileReader:
@@ -339,7 +313,7 @@ class HostFileReader:
         self.block_size = min(
             block_size,
             _READ_BLOCK_BYTES,
-            max(1, self._state.pool.slot_bytes // max_threads),
+            max(1, self._state.slot_bytes // max_threads),
         )
 
     def submit_read(
@@ -365,18 +339,15 @@ class HostFileReader:
             if state.closed:
                 raise RuntimeError("host file reader is closed")
             if not entries:
-                request.producing = False
                 request.done.set()
                 return request
-            if not state.threads:
+            if state.thread is None:
                 try:
-                    for target, name in (
-                        (state.produce, "fst-host-read"),
-                        (state.consume, "fst-host-copy"),
-                    ):
-                        thread = threading.Thread(target=target, name=name, daemon=True)
-                        thread.start()
-                        state.threads.append(thread)
+                    thread = threading.Thread(
+                        target=state.run, name="fst-host-reader", daemon=True
+                    )
+                    thread.start()
+                    state.thread = thread
                 except BaseException:
                     state.closed = True
                     state.condition.notify_all()
@@ -393,7 +364,6 @@ class HostFileReader:
 
     def cancel_read(self, request: HostReadRequest) -> None:
         request.cancelled.set()
-        self._state.pool.wake()
         self.wait_read(request)
 
     def close(self) -> None:
@@ -403,11 +373,12 @@ class HostFileReader:
             for request in state.requests:
                 request.cancelled.set()
             state.condition.notify_all()
-        state.pool.wake()
-        for thread in state.threads:
+            thread = state.thread
+        if thread is not None:
             thread.join()
-        state.threads.clear()
-        state.pool.buffers.clear()
+        with state.condition:
+            state.thread = None
+            state.buffers.clear()
 
     def __del__(self) -> None:
         if hasattr(self, "_state"):

@@ -291,9 +291,11 @@ slots; at least two pages are required. Backing-cache over-allocation and idle
 retention are not bounded by this setting. Pageable sources are rejected, not
 staged. Export length and backing capacity are checked separately.
 
-DMA uses physical byte ranges and the caller's captured stream. The reader
-enqueues up to two owning tickets before waiting; single/tail work progresses
-without `wait_read()`. Slots become reusable only after completion is proved.
+DMA uses physical byte ranges and the caller's captured stream. One reader
+worker drives the request FIFO and both slots; a bounded `preadv` worker pool
+can fill the next slot while DMA runs. The reader enqueues up to two owning
+tickets before waiting; single/tail work progresses without `wait_read()`.
+Slots become reusable only after completion is proved.
 Direct `copy_raw_tensors()` remains blocking. Existing stream-wide synchronization
 may complete later work too; each ticket retains its exports, pinned storage,
 destination handles and stream until its completion is checked. This binding holds

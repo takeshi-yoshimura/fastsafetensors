@@ -186,9 +186,7 @@ def test_multiple_files_progress_without_wait_and_submit_never_waits_for_pool(
 
 
 @pytest.mark.parametrize("capacity", [4, 16, 20])
-def test_ragged_groups_account_for_busy_ready_and_retained_buffers(
-    ops, tmp_path, capacity, monkeypatch
-):
+def test_ragged_groups_reuse_two_bounded_slots(ops, tmp_path, capacity, monkeypatch):
     monkeypatch.setattr(host, "_HOST_BYTES", capacity)
     data = bytes(range(128))
     path = tmp_path / "data"
@@ -204,10 +202,8 @@ def test_ragged_groups_account_for_busy_ready_and_retained_buffers(
                         bytes(ops.host_buffer_view(dst))
                         == data[begin : begin + dst.get_nbytes()]
                     )
-                assert len(reader._state.pool.buffers) == 2
-                assert (
-                    sum(b.get_nbytes() for b in reader._state.pool.buffers) <= capacity
-                )
+                assert len(reader._state.buffers) == 2
+                assert sum(b.get_nbytes() for b in reader._state.buffers) <= capacity
     finally:
         reader.close()
     assert ops.peak <= capacity
@@ -328,7 +324,7 @@ def test_cancel_drains_read_and_never_starts_copy(ops, tmp_path, monkeypatch):
             assert not cancelled.done()
             release.set()
             cancelled.result(5)
-            assert not ops.copies and not reader._state.pool.busy
+            assert not ops.copies
     finally:
         release.set()
         reader.close()
@@ -338,8 +334,10 @@ def test_close_drains_running_copy_cancels_pending_and_joins_threads(ops, tmp_pa
     path = tmp_path / "data"
     path.write_bytes(b"abcdefgh" * 20)
     active, release = threading.Event(), threading.Event()
+    copied = []
 
     def copy(entries):
+        copied.append(entries[0][1])
         active.set()
         assert release.wait(5)
 
@@ -350,15 +348,17 @@ def test_close_drains_running_copy_cancels_pending_and_joins_threads(ops, tmp_pa
         request = submit(reader, entries_for(f.fileno(), [8] * 20))
         try:
             assert active.wait(5)
+            queued = submit(reader, entries_for(f.fileno(), [8]))
             closed = waiter.submit(reader.close)
             assert request.cancelled.wait(5)
+            assert queued.cancelled.wait(5) and not queued.done.is_set()
             assert not closed.done()
         finally:
             release.set()
         closed.result(5)
-        assert request.done.is_set()
-        assert len(ops.copies) == 1
-        assert not state.threads and not state.pool.buffers and not state.requests
+        assert request.done.is_set() and queued.done.is_set()
+        assert len(copied) == len(ops.copies) == 1
+        assert state.thread is None and not state.buffers and not state.requests
         reader.close()
         with pytest.raises(RuntimeError, match="closed"):
             submit(reader, [])
@@ -411,7 +411,6 @@ def test_dma_failure_drains_queued_and_pool_blocked_requests(ops, tmp_path):
             for request in (one, two):
                 with pytest.raises(RuntimeError, match="uncertain DMA|restart"):
                     reader.wait_read(request)
-            assert not reader._state.pool.busy
     finally:
         release.set()
         reader.close()
@@ -445,7 +444,7 @@ def test_worker_start_failure_is_closeable(ops, monkeypatch):
     start = threading.Thread.start
 
     def fail(thread):
-        if thread.name == "fst-host-copy":
+        if thread.name == "fst-host-reader":
             raise RuntimeError("thread start failed")
         start(thread)
 
@@ -454,7 +453,7 @@ def test_worker_start_failure_is_closeable(ops, monkeypatch):
     with pytest.raises(RuntimeError, match="thread start failed"):
         submit(reader, entries_for(0, [8]))
     reader.close()
-    assert not reader._state.threads
+    assert reader._state.thread is None
 
 
 def test_owner_collection_stops_idle_workers_and_frees_pool(ops, tmp_path):
@@ -464,10 +463,10 @@ def test_owner_collection_stops_idle_workers_and_frees_pool(ops, tmp_path):
     state = reader._state
     with path.open("rb") as f:
         reader.wait_read(submit(reader, entries_for(f.fileno(), [8])))
-    threads = list(state.threads)
+    thread = state.thread
     del reader
     gc.collect()
-    assert threads and all(not t.is_alive() for t in threads)
+    assert thread is not None and not thread.is_alive()
     assert all(ref() is None for ref in ops.allocations)
 
 
@@ -479,32 +478,32 @@ def test_empty_request_and_invalid_sizes_allocate_nothing(ops):
             submit(reader, [((0, 0), ByteTensor(Storage()))])
         with pytest.raises(ValueError, match="positive"):
             reader.submit_read([], Device(), 0)
-        assert not reader._state.threads and not ops.allocations
+        assert reader._state.thread is None and not ops.allocations
     finally:
         reader.close()
 
 
 def test_slot_capacity_rounds_down_and_rejects_less_than_two_aligned_slots(
-    ops, monkeypatch
+    ops, monkeypatch, tmp_path
 ):
     monkeypatch.setattr(ops, "transfer_alignment", lambda: 8)
     with pytest.raises(ValueError, match="two 8-byte aligned slots"):
         host.HostFileReader(ops, max_bytes=15)
     reader = host.HostFileReader(ops, max_bytes=39)
+    path = tmp_path / "data"
+    path.write_bytes(bytes(24))
     try:
-        pool = reader._state.pool
-        assert pool.slot_bytes == 16
-        first = pool.acquire(lambda: False)
-        second = pool.acquire(lambda: False)
-        assert first is not second
-        assert pool.peak_bytes == 32 <= 39
-        pool.release(first)
-        pool.release(second)
+        with path.open("rb") as f:
+            reader.wait_read(submit(reader, entries_for(f.fileno(), [24])))
+        assert list(map(len, ops.copies)) == [16, 8]
+        assert len(ops.allocations) == 2 and ops.peak == 32
     finally:
         reader.close()
 
 
-def test_failed_second_slot_allocation_does_not_leave_a_half_pool(ops, monkeypatch):
+def test_failed_second_slot_allocation_does_not_leave_a_half_pool(
+    ops, monkeypatch, tmp_path
+):
     allocate = ops.allocate_host_buffer
     calls = 0
 
@@ -517,14 +516,15 @@ def test_failed_second_slot_allocation_does_not_leave_a_half_pool(ops, monkeypat
 
     monkeypatch.setattr(ops, "allocate_host_buffer", fail)
     reader = host.HostFileReader(ops)
+    path = tmp_path / "data"
+    path.write_bytes(b"abcdefgh")
     try:
-        pool = reader._state.pool
-        with pytest.raises(MemoryError, match="second slot"):
-            pool.acquire(lambda: False)
-        assert not pool.buffers and not pool.busy
-        leased = pool.acquire(lambda: False)
-        assert len(pool.buffers) == 2
-        pool.release(leased)
+        with path.open("rb") as f:
+            with pytest.raises(MemoryError, match="second slot"):
+                reader.wait_read(submit(reader, entries_for(f.fileno(), [8])))
+            assert not reader._state.buffers
+            reader.wait_read(submit(reader, entries_for(f.fileno(), [8])))
+        assert len(reader._state.buffers) == 2 and ops.copies == [b"abcdefgh"]
     finally:
         reader.close()
 
@@ -600,7 +600,7 @@ def test_deferred_copy_fills_two_slots_then_waits_and_tail_progresses(
         assert events.count("enqueue") == events.count("wait") == count
         if count > 1:
             assert events[:3] == ["enqueue", "enqueue", "wait"]
-        assert not deferred.active and not reader._state.pool.busy
+        assert not deferred.active
         assert len(deferred.allocations) == 2 and deferred.peak == 16
     finally:
         reader.close()
@@ -633,7 +633,7 @@ def test_deferred_pending_slots_not_reused_and_cancel_close_drain_both(
         with path.open("rb") as file, ThreadPoolExecutor(1) as executor:
             request = submit(reader, entries_for(file.fileno(), [32]))
             assert waiting.wait(5)
-            assert len(reader._state.pool.busy) == len(deferred.active) == 2
+            assert len(deferred.active) == 2
             assert not request.done.is_set()
             if action != "finish":
                 operation = (
@@ -738,7 +738,6 @@ def test_deferred_failure_with_earlier_pending_work_retains_or_drains(
             assert request.done.wait(5), "failure stranded pending work"
             with pytest.raises((RuntimeError, OSError), match="failed|unknown|drained"):
                 reader.wait_read(request)
-            assert not reader._state.pool.busy
             if failure in {"wait", "enqueue-unknown"}:
                 with pytest.raises(RuntimeError, match="restart"):
                     submit(reader, entries)

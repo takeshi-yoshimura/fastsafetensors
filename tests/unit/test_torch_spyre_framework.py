@@ -750,7 +750,6 @@ def test_reader_enqueues_both_slots_before_wait_and_never_reuses_pending_slot(
             )
             assert waiting.wait(5) and read_second.wait(5)
             assert len(launches) == 2 and len(_torch_spyre._raw_transfers) == 2
-            assert len(reader._state.pool.busy) == 2
             assert not request.done.is_set()
             closed = waiter.submit(reader.close)
             assert request.cancelled.wait(5) and not closed.done()
